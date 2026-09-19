@@ -216,6 +216,12 @@ class DatabaseManager:
                 UNIQUE(user_id, asin)
             );
         """)
+        self.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT
+            );
+        """)
         for col, defn in [
             ("username",              "TEXT"),
             ("joined_at",             "TIMESTAMPTZ DEFAULT NOW()"),
@@ -282,6 +288,16 @@ class DatabaseManager:
 
     def get_all_products_flat(self):
         return self.execute("SELECT * FROM products ORDER BY id", fetch_all=True) or []
+
+    def get_setting(self, key, default=None):
+        row = self.execute("SELECT value FROM settings WHERE key=%s", (key,), fetch_one=True)
+        return row["value"] if row else default
+
+    def set_setting(self, key, value):
+        self.execute("""
+            INSERT INTO settings (key, value) VALUES (%s, %s)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        """, (key, value))
 
     def get_all_products_with_users(self):
         return self.execute("""
@@ -1268,6 +1284,15 @@ def handle_message(update: Update, context: CallbackContext):
     text    = update.message.text.strip() if update.message.text else ""
     try:
         db.upsert_user(user_id, update.effective_chat.id, update.effective_user.username)
+        if context.user_data.get("awaiting_broadcast_msg"):
+            context.user_data.pop("awaiting_broadcast_msg")
+            db.set_setting("broadcast_message", update.message.text)
+            update.message.reply_text(
+                "✅ *Broadcast message saved!*\n\nYe ab se har interval par channel mein jayega.",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=main_menu_keyboard()
+            )
+            return
         if context.user_data.get("awaiting_link"):
             context.user_data.pop("awaiting_link")
             asin = AmazonScraper.extract_asin(text)
@@ -1311,6 +1336,15 @@ def handle_message(update: Update, context: CallbackContext):
 
 def broadcast_list(context: CallbackContext):
     try:
+        custom_msg = db.get_setting("broadcast_message")
+        if custom_msg:
+            context.bot.send_message(
+                chat_id=GROUP_CHAT_ID,
+                text=custom_msg,
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=True
+            )
+            return
         products = db.get_all_products_flat()
         if not products:
             return
@@ -1328,6 +1362,39 @@ def broadcast_list(context: CallbackContext):
         )
     except Exception as e:
         logger.error(f"broadcast_list error: {e}")
+
+
+def _reschedule_broadcast_job(job_queue, minutes: int):
+    for job in job_queue.get_jobs_by_name("broadcast_list_job"):
+        job.schedule_removal()
+    job_queue.run_repeating(broadcast_list, interval=minutes * 60, first=10, name="broadcast_list_job")
+
+
+def broadcast_cmd(update: Update, context: CallbackContext):
+    context.user_data["awaiting_broadcast_msg"] = True
+    context.user_data.pop("awaiting_link", None)
+    update.message.reply_text(
+        "📝 *Apna broadcast message bhejo:*\n\n"
+        "_Ye message ab se har interval par channel mein jayega (list-summary ki jagah)._",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+
+def interval_cmd(update: Update, context: CallbackContext):
+    args = context.args
+    if not args or not args[0].isdigit() or int(args[0]) <= 0:
+        update.message.reply_text(
+            "⚠️ *Usage:* `/interval <minutes>`\n\n_Example: /interval 15_",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    minutes = int(args[0])
+    db.set_setting("broadcast_interval_minutes", str(minutes))
+    _reschedule_broadcast_job(context.job_queue, minutes)
+    update.message.reply_text(
+        f"✅ *Broadcast interval set to {minutes} minute(s).*",
+        parse_mode=ParseMode.MARKDOWN
+    )
 
 
 def scheduled_stock_check(context: CallbackContext):
@@ -1723,6 +1790,8 @@ def main():
     dp = updater.dispatcher
     dp.add_handler(CommandHandler("start",       start))
     dp.add_handler(CommandHandler("id",          id_cmd))
+    dp.add_handler(CommandHandler("broadcast",   broadcast_cmd))
+    dp.add_handler(CommandHandler("interval",    interval_cmd))
     dp.add_handler(CommandHandler("status",      status_check))
     dp.add_handler(CallbackQueryHandler(button_handler))
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
@@ -1738,8 +1807,10 @@ def main():
     updater.job_queue.run_repeating(_keepalive_ping, interval=60, first=10)
     logger.info("✅ DB keepalive registered (every 60s)")
 
-    updater.job_queue.run_repeating(broadcast_list, interval=600, first=60)
-    logger.info("✅ Channel list-broadcast registered (every 10 min)")
+    _saved_interval = db.get_setting("broadcast_interval_minutes")
+    _broadcast_minutes = int(_saved_interval) if _saved_interval and _saved_interval.isdigit() else 10
+    updater.job_queue.run_repeating(broadcast_list, interval=_broadcast_minutes * 60, first=60, name="broadcast_list_job")
+    logger.info(f"✅ Channel broadcast registered (every {_broadcast_minutes} min)")
 
     updater.start_polling(drop_pending_updates=True, poll_interval=1.0, timeout=20)
     logger.info("✅ Bot is live! Send /start to begin.")
