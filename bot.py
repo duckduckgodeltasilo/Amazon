@@ -1311,7 +1311,51 @@ def button_handler(update: Update, context: CallbackContext):
     if data == "noop":
         return
 
-    if data.startswith("bcrt_"):
+    if data == "bc_new":
+        context.user_data["awaiting_broadcast_msg"] = True
+        context.user_data.pop("awaiting_link", None)
+        query.message.reply_text(
+            "📝 *Send your broadcast message:*\n\n_I'll ask for its interval next.*",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    if data == "bc_list":
+        messages = db.get_broadcast_messages()
+        if not messages:
+            query.message.reply_text(
+                "🗂️ *No broadcast messages saved.*\n\nUse /broadcast → New to add one.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        for m in messages:
+            query.message.reply_text(
+                f"`#{m['id']}` _(every {m['interval_minutes']} min)_\n{_short_preview(m['text'], 80)}",
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=True
+            )
+        return
+
+    if data == "bc_remove":
+        messages = db.get_broadcast_messages()
+        if not messages:
+            query.message.reply_text(
+                "🗂️ *No broadcast messages saved.*",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        keyboard = [
+            [InlineKeyboardButton(f"❌ {_short_preview(m['text'])}", callback_data=f"bcrm_{m['id']}")]
+            for m in messages
+        ]
+        query.message.reply_text(
+            "🗑 *Pick a message to remove:*",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+
+    if data.startswith("bciv_"):
         msg_id = int(data[5:])
         context.user_data["awaiting_retime_id"] = msg_id
         query.message.reply_text(
@@ -1381,23 +1425,6 @@ def handle_message(update: Update, context: CallbackContext):
             db.set_broadcast_interval(msg_id, minutes)
             update.message.reply_text(
                 f"✅ *Broadcast #{msg_id} will now be sent every {minutes} minute(s).*",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=main_menu_keyboard()
-            )
-            return
-        if context.user_data.get("awaiting_interval"):
-            context.user_data.pop("awaiting_interval")
-            if not text.isdigit() or int(text) <= 0:
-                update.message.reply_text(
-                    "❌ *Please send a valid number of minutes.*",
-                    parse_mode=ParseMode.MARKDOWN
-                )
-                return
-            minutes = int(text)
-            db.set_setting("broadcast_interval_minutes", str(minutes))
-            _reschedule_broadcast_job(context.job_queue, minutes)
-            update.message.reply_text(
-                f"✅ *Broadcast interval set to {minutes} minute(s).*",
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=main_menu_keyboard()
             )
@@ -1501,64 +1528,40 @@ def broadcast_ticker(context: CallbackContext):
         logger.error(f"broadcast_ticker error: {e}")
 
 
-def _reschedule_broadcast_job(job_queue, minutes: int):
-    for job in job_queue.get_jobs_by_name("broadcast_list_job"):
-        job.schedule_removal()
-    job_queue.run_repeating(broadcast_list, interval=minutes * 60, first=10, name="broadcast_list_job")
+def _short_preview(text, length=40):
+    text = text.strip().replace("\n", " ")
+    return text[:length] + ("…" if len(text) > length else "")
 
 
 def broadcast_cmd(update: Update, context: CallbackContext):
-    context.user_data["awaiting_broadcast_msg"] = True
-    context.user_data.pop("awaiting_link", None)
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🆕 New",    callback_data="bc_new"),
+        InlineKeyboardButton("📋 List",   callback_data="bc_list"),
+        InlineKeyboardButton("🗑 Remove", callback_data="bc_remove"),
+    ]])
     update.message.reply_text(
-        "📝 *Send your broadcast message:*\n\n"
-        "_I'll ask for its interval next. Every saved message is sent to the channel on its own schedule. "
-        "Use /listbroadcasts to view, retime, or remove any._",
-        parse_mode=ParseMode.MARKDOWN
+        "📢 *Broadcast Messages*\n\n_Choose an action:_",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=keyboard
     )
-
-
-def listbroadcasts_cmd(update: Update, context: CallbackContext):
-    messages = db.get_broadcast_messages()
-    if not messages:
-        update.message.reply_text(
-            "🗂️ *No broadcast messages saved.*\n\nSend /broadcast to add one.",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        return
-    update.message.reply_text(
-        f"📋 *Saved Broadcast Messages ({len(messages)}):*",
-        parse_mode=ParseMode.MARKDOWN
-    )
-    for m in messages:
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("⏱️ Retime", callback_data=f"bcrt_{m['id']}"),
-            InlineKeyboardButton("❌ Remove", callback_data=f"bcrm_{m['id']}"),
-        ]])
-        update.message.reply_text(
-            f"`#{m['id']}` _(every {m['interval_minutes']} min)_\n{m['text']}",
-            parse_mode=ParseMode.MARKDOWN,
-            disable_web_page_preview=True,
-            reply_markup=keyboard
-        )
 
 
 def interval_cmd(update: Update, context: CallbackContext):
-    args = context.args
-    if not args or not args[0].isdigit() or int(args[0]) <= 0:
-        context.user_data["awaiting_interval"] = True
+    messages = db.get_broadcast_messages()
+    if not messages:
         update.message.reply_text(
-            "⏱️ *Interval (minutes) for the tracked-products list-summary?*\n\n"
-            "_Just send a number, e.g. 15_",
+            "🗂️ *No broadcast messages saved.*\n\nUse /broadcast → New to add one.",
             parse_mode=ParseMode.MARKDOWN
         )
         return
-    minutes = int(args[0])
-    db.set_setting("broadcast_interval_minutes", str(minutes))
-    _reschedule_broadcast_job(context.job_queue, minutes)
+    keyboard = [
+        [InlineKeyboardButton(f"{_short_preview(m['text'])}  ⏱ {m['interval_minutes']}m", callback_data=f"bciv_{m['id']}")]
+        for m in messages
+    ]
     update.message.reply_text(
-        f"✅ *Broadcast interval set to {minutes} minute(s).*",
-        parse_mode=ParseMode.MARKDOWN
+        "⏱️ *Pick a message to change its interval:*",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 
@@ -1958,7 +1961,6 @@ def main():
     dp.add_handler(CommandHandler("start",       start))
     dp.add_handler(CommandHandler("id",          id_cmd))
     dp.add_handler(CommandHandler("broadcast",   broadcast_cmd))
-    dp.add_handler(CommandHandler("listbroadcasts", listbroadcasts_cmd))
     dp.add_handler(CommandHandler("interval",    interval_cmd))
     dp.add_handler(CommandHandler("status",      status_check))
     dp.add_handler(CallbackQueryHandler(button_handler))
@@ -1975,10 +1977,8 @@ def main():
     updater.job_queue.run_repeating(_keepalive_ping, interval=60, first=10)
     logger.info("✅ DB keepalive registered (every 60s)")
 
-    _saved_interval = db.get_setting("broadcast_interval_minutes")
-    _broadcast_minutes = int(_saved_interval) if _saved_interval and _saved_interval.isdigit() else 10
-    updater.job_queue.run_repeating(broadcast_list, interval=_broadcast_minutes * 60, first=60, name="broadcast_list_job")
-    logger.info(f"✅ Channel broadcast registered (every {_broadcast_minutes} min)")
+    updater.job_queue.run_repeating(broadcast_list, interval=600, first=60, name="broadcast_list_job")
+    logger.info("✅ Channel broadcast registered (every 10 min, fixed)")
 
     updater.job_queue.run_repeating(broadcast_ticker, interval=60, first=30, name="broadcast_ticker_job")
     logger.info("✅ Per-message broadcast ticker registered (checks every 1 min)")
