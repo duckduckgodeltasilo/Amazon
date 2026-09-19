@@ -221,8 +221,8 @@ class DatabaseManager:
             ("joined_at",             "TIMESTAMPTZ DEFAULT NOW()"),
             ("added_at",              "TIMESTAMPTZ DEFAULT NOW()"),
             ("is_stopped",            "BOOLEAN DEFAULT FALSE"),
-            ("instock_alert_count",   "INTEGER DEFAULT 10"),
-            ("pricedrop_alert_count", "INTEGER DEFAULT 10"),
+            ("instock_alert_count",   "INTEGER DEFAULT 5"),
+            ("pricedrop_alert_count", "INTEGER DEFAULT 5"),
             ("alert_gap_seconds",     "INTEGER DEFAULT 1"),
         ]:
             self._add_column_if_missing("users", col, defn)
@@ -242,6 +242,8 @@ class DatabaseManager:
         except Exception:
             pass
         self._add_column_if_missing("products", "last_price", "TEXT")
+        self.execute("UPDATE users SET instock_alert_count=5 WHERE instock_alert_count=10;")
+        self.execute("UPDATE users SET pricedrop_alert_count=5 WHERE pricedrop_alert_count=10;")
         logger.info("✅ Schema ready")
 
     def _add_column_if_missing(self, table, col, defn):
@@ -335,10 +337,10 @@ class DatabaseManager:
             (user_id,), fetch_one=True
         )
         if not row:
-            return {"instock_alert_count": 10, "pricedrop_alert_count": 10, "alert_gap_seconds": 2}
+            return {"instock_alert_count": 5, "pricedrop_alert_count": 5, "alert_gap_seconds": 2}
         return {
-            "instock_alert_count":   row["instock_alert_count"]  or 10,
-            "pricedrop_alert_count": row["pricedrop_alert_count"] or 10,
+            "instock_alert_count":   row["instock_alert_count"]  or 5,
+            "pricedrop_alert_count": row["pricedrop_alert_count"] or 5,
             "alert_gap_seconds":     row["alert_gap_seconds"] if row["alert_gap_seconds"] is not None else 2,
         }
 
