@@ -372,6 +372,9 @@ class DatabaseManager:
     def remove_all_products(self, user_id):
         return self.execute("DELETE FROM products WHERE user_id=%s", (user_id,))
 
+    def update_title(self, product_id, title):
+        return self.execute("UPDATE products SET title=%s WHERE id=%s", (title, product_id))
+
     def set_user_stopped(self, user_id, stopped: bool):
         self.execute("UPDATE users SET is_stopped=%s WHERE user_id=%s", (stopped, user_id))
 
@@ -1440,6 +1443,24 @@ def handle_message(update: Update, context: CallbackContext):
 #  SCHEDULED STOCK CHECK
 # ═══════════════════════════════════════════════
 
+def _refresh_existing_titles():
+    """Startup ke waqt ek baar chalta hai — purane saved titles ko naye KNOWN_COLORS
+    list ke hisaab se re-order karta hai (koi Amazon fetch nahi, sirf DB text update)."""
+    try:
+        products = db.get_all_products_flat()
+        updated = 0
+        for p in products:
+            old_title = p.get("title") or ""
+            new_title = AmazonScraper._reorder_color(old_title)
+            if new_title != old_title:
+                db.update_title(p["id"], new_title)
+                updated += 1
+        if updated:
+            logger.info(f"🎨 Refreshed {updated} product title(s) with updated color list.")
+    except Exception as e:
+        logger.error(f"_refresh_existing_titles error: {e}")
+
+
 def broadcast_list(context: CallbackContext):
     """Sends the tracked-products list-summary — runs independently of custom broadcast messages."""
     try:
@@ -1911,6 +1932,8 @@ def main():
     else:
         logger.info("🌐 Cloudflare proxy NOT configured — hitting Amazon.in directly (set CF_PROXY_URL/CF_PROXY_KEY to enable)")
     logger.info("=" * 60)
+
+    _refresh_existing_titles()
 
     threading.Thread(target=_run_health_server, daemon=True).start()
     logger.info(f"✅ Health server on port {PORT}")
