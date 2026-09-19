@@ -977,6 +977,15 @@ def _cookie_refresh_thread():
         time.sleep(AmazonScraper._COOKIE_REFRESH_TTL)
 
 
+def debug_log_chat_id(update: Update, context: CallbackContext):
+    try:
+        chat = update.effective_chat
+        if chat:
+            logger.info(f"🆔 DEBUG chat_id={chat.id} type={chat.type} title={getattr(chat, 'title', None)}")
+    except Exception as e:
+        logger.error(f"debug_log_chat_id error: {e}")
+
+
 def id_cmd(update: Update, context: CallbackContext):
     update.message.reply_text(f"Chat ID: `{update.effective_chat.id}`", parse_mode=ParseMode.MARKDOWN)
 
@@ -1695,6 +1704,7 @@ def main():
     dp = updater.dispatcher
     dp.add_handler(CommandHandler("start",       start))
     dp.add_handler(CommandHandler("id",          id_cmd))
+    dp.add_handler(MessageHandler(Filters.all, debug_log_chat_id), group=1)
     dp.add_handler(CommandHandler("status",      status_check))
     dp.add_handler(CallbackQueryHandler(button_handler))
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
