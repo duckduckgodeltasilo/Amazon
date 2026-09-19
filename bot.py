@@ -1249,6 +1249,7 @@ def button_handler(update: Update, context: CallbackContext):
     query = update.callback_query
     query.answer()
     data  = query.data
+    logger.info(f"🔘 button_handler received: {data}")
 
     command_map = {
         "cmd_add":        add_cmd,
