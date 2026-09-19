@@ -222,6 +222,18 @@ class DatabaseManager:
                 value TEXT
             );
         """)
+        self.execute("""
+            CREATE TABLE IF NOT EXISTS broadcast_messages (
+                id         SERIAL PRIMARY KEY,
+                text       TEXT NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        for col, defn in [
+            ("interval_minutes", "INTEGER DEFAULT 10"),
+            ("last_sent",        "TIMESTAMPTZ"),
+        ]:
+            self._add_column_if_missing("broadcast_messages", col, defn)
         for col, defn in [
             ("username",              "TEXT"),
             ("joined_at",             "TIMESTAMPTZ DEFAULT NOW()"),
@@ -298,6 +310,35 @@ class DatabaseManager:
             INSERT INTO settings (key, value) VALUES (%s, %s)
             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
         """, (key, value))
+
+    def add_broadcast_message(self, text, interval_minutes=10):
+        return self.execute(
+            "INSERT INTO broadcast_messages (text, interval_minutes) VALUES (%s, %s) RETURNING id",
+            (text, interval_minutes), fetch_one=True
+        )
+
+    def get_broadcast_messages(self):
+        return self.execute("SELECT * FROM broadcast_messages ORDER BY id", fetch_all=True) or []
+
+    def get_due_broadcast_messages(self):
+        return self.execute("""
+            SELECT * FROM broadcast_messages
+            WHERE last_sent IS NULL
+               OR last_sent <= NOW() - (interval_minutes || ' minutes')::INTERVAL
+            ORDER BY id
+        """, fetch_all=True) or []
+
+    def mark_broadcast_sent(self, msg_id):
+        self.execute("UPDATE broadcast_messages SET last_sent = NOW() WHERE id=%s", (msg_id,))
+
+    def set_broadcast_interval(self, msg_id, minutes):
+        return self.execute(
+            "UPDATE broadcast_messages SET interval_minutes=%s WHERE id=%s RETURNING id",
+            (minutes, msg_id), fetch_one=True
+        )
+
+    def remove_broadcast_message(self, msg_id):
+        return self.execute("DELETE FROM broadcast_messages WHERE id=%s", (msg_id,))
 
     def get_all_products_with_users(self):
         return self.execute("""
@@ -1267,6 +1308,21 @@ def button_handler(update: Update, context: CallbackContext):
     if data == "noop":
         return
 
+    if data.startswith("bcrt_"):
+        msg_id = int(data[5:])
+        context.user_data["awaiting_retime_id"] = msg_id
+        query.message.reply_text(
+            f"⏱️ *New interval (in minutes) for broadcast #{msg_id}?*",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    if data.startswith("bcrm_"):
+        msg_id = int(data[5:])
+        db.remove_broadcast_message(msg_id)
+        query.edit_message_text(f"🗑️ *Removed broadcast #{msg_id}.*", parse_mode=ParseMode.MARKDOWN)
+        return
+
     if data == "rm_cancel":
         context.user_data.pop("remove_list", None)
         query.edit_message_text("👍 *Cancelled.* Nothing was removed.", parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_keyboard())
@@ -1286,9 +1342,59 @@ def handle_message(update: Update, context: CallbackContext):
         db.upsert_user(user_id, update.effective_chat.id, update.effective_user.username)
         if context.user_data.get("awaiting_broadcast_msg"):
             context.user_data.pop("awaiting_broadcast_msg")
-            db.set_setting("broadcast_message", update.message.text)
+            context.user_data["pending_broadcast_text"] = update.message.text
+            context.user_data["awaiting_broadcast_interval"] = True
             update.message.reply_text(
-                "✅ *Broadcast message saved!*\n\nYe ab se har interval par channel mein jayega.",
+                "⏱️ *How many minutes between sends for this message?*\n\n_Just send a number, e.g. 30_",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        if context.user_data.get("awaiting_broadcast_interval"):
+            context.user_data.pop("awaiting_broadcast_interval")
+            pending_text = context.user_data.pop("pending_broadcast_text", None)
+            if not text.isdigit() or int(text) <= 0 or not pending_text:
+                update.message.reply_text(
+                    "❌ *Please send a valid number of minutes.*",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+            minutes = int(text)
+            row = db.add_broadcast_message(pending_text, minutes)
+            update.message.reply_text(
+                f"✅ *Broadcast #{row['id'] if row else '?'} saved!*\n\nIt'll be sent to the channel every {minutes} minute(s).",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=main_menu_keyboard()
+            )
+            return
+        if context.user_data.get("awaiting_retime_id"):
+            msg_id = context.user_data.pop("awaiting_retime_id")
+            if not text.isdigit() or int(text) <= 0:
+                update.message.reply_text(
+                    "❌ *Please send a valid number of minutes.*",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+            minutes = int(text)
+            db.set_broadcast_interval(msg_id, minutes)
+            update.message.reply_text(
+                f"✅ *Broadcast #{msg_id} will now be sent every {minutes} minute(s).*",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=main_menu_keyboard()
+            )
+            return
+        if context.user_data.get("awaiting_interval"):
+            context.user_data.pop("awaiting_interval")
+            if not text.isdigit() or int(text) <= 0:
+                update.message.reply_text(
+                    "❌ *Please send a valid number of minutes.*",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+            minutes = int(text)
+            db.set_setting("broadcast_interval_minutes", str(minutes))
+            _reschedule_broadcast_job(context.job_queue, minutes)
+            update.message.reply_text(
+                f"✅ *Broadcast interval set to {minutes} minute(s).*",
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=main_menu_keyboard()
             )
@@ -1335,16 +1441,8 @@ def handle_message(update: Update, context: CallbackContext):
 # ═══════════════════════════════════════════════
 
 def broadcast_list(context: CallbackContext):
+    """Sends the tracked-products list-summary — runs independently of custom broadcast messages."""
     try:
-        custom_msg = db.get_setting("broadcast_message")
-        if custom_msg:
-            context.bot.send_message(
-                chat_id=GROUP_CHAT_ID,
-                text=custom_msg,
-                parse_mode=ParseMode.MARKDOWN,
-                disable_web_page_preview=True
-            )
-            return
         products = db.get_all_products_flat()
         if not products:
             return
@@ -1364,6 +1462,24 @@ def broadcast_list(context: CallbackContext):
         logger.error(f"broadcast_list error: {e}")
 
 
+def broadcast_ticker(context: CallbackContext):
+    """Runs every minute — sends each saved broadcast message on its own interval."""
+    try:
+        for m in db.get_due_broadcast_messages():
+            try:
+                context.bot.send_message(
+                    chat_id=GROUP_CHAT_ID,
+                    text=m["text"],
+                    parse_mode=ParseMode.MARKDOWN,
+                    disable_web_page_preview=True
+                )
+                db.mark_broadcast_sent(m["id"])
+            except TelegramError as e:
+                logger.error(f"broadcast_ticker send error (msg {m['id']}): {e}")
+    except Exception as e:
+        logger.error(f"broadcast_ticker error: {e}")
+
+
 def _reschedule_broadcast_job(job_queue, minutes: int):
     for job in job_queue.get_jobs_by_name("broadcast_list_job"):
         job.schedule_removal()
@@ -1374,17 +1490,45 @@ def broadcast_cmd(update: Update, context: CallbackContext):
     context.user_data["awaiting_broadcast_msg"] = True
     context.user_data.pop("awaiting_link", None)
     update.message.reply_text(
-        "📝 *Apna broadcast message bhejo:*\n\n"
-        "_Ye message ab se har interval par channel mein jayega (list-summary ki jagah)._",
+        "📝 *Send your broadcast message:*\n\n"
+        "_I'll ask for its interval next. Every saved message is sent to the channel on its own schedule. "
+        "Use /listbroadcasts to view, retime, or remove any._",
         parse_mode=ParseMode.MARKDOWN
     )
+
+
+def listbroadcasts_cmd(update: Update, context: CallbackContext):
+    messages = db.get_broadcast_messages()
+    if not messages:
+        update.message.reply_text(
+            "🗂️ *No broadcast messages saved.*\n\nSend /broadcast to add one.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    update.message.reply_text(
+        f"📋 *Saved Broadcast Messages ({len(messages)}):*",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    for m in messages:
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("⏱️ Retime", callback_data=f"bcrt_{m['id']}"),
+            InlineKeyboardButton("❌ Remove", callback_data=f"bcrm_{m['id']}"),
+        ]])
+        update.message.reply_text(
+            f"`#{m['id']}` _(every {m['interval_minutes']} min)_\n{m['text']}",
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True,
+            reply_markup=keyboard
+        )
 
 
 def interval_cmd(update: Update, context: CallbackContext):
     args = context.args
     if not args or not args[0].isdigit() or int(args[0]) <= 0:
+        context.user_data["awaiting_interval"] = True
         update.message.reply_text(
-            "⚠️ *Usage:* `/interval <minutes>`\n\n_Example: /interval 15_",
+            "⏱️ *Interval (minutes) for the tracked-products list-summary?*\n\n"
+            "_Just send a number, e.g. 15_",
             parse_mode=ParseMode.MARKDOWN
         )
         return
@@ -1791,6 +1935,7 @@ def main():
     dp.add_handler(CommandHandler("start",       start))
     dp.add_handler(CommandHandler("id",          id_cmd))
     dp.add_handler(CommandHandler("broadcast",   broadcast_cmd))
+    dp.add_handler(CommandHandler("listbroadcasts", listbroadcasts_cmd))
     dp.add_handler(CommandHandler("interval",    interval_cmd))
     dp.add_handler(CommandHandler("status",      status_check))
     dp.add_handler(CallbackQueryHandler(button_handler))
@@ -1811,6 +1956,9 @@ def main():
     _broadcast_minutes = int(_saved_interval) if _saved_interval and _saved_interval.isdigit() else 10
     updater.job_queue.run_repeating(broadcast_list, interval=_broadcast_minutes * 60, first=60, name="broadcast_list_job")
     logger.info(f"✅ Channel broadcast registered (every {_broadcast_minutes} min)")
+
+    updater.job_queue.run_repeating(broadcast_ticker, interval=60, first=30, name="broadcast_ticker_job")
+    logger.info("✅ Per-message broadcast ticker registered (checks every 1 min)")
 
     updater.start_polling(drop_pending_updates=True, poll_interval=1.0, timeout=20)
     logger.info("✅ Bot is live! Send /start to begin.")
