@@ -1314,7 +1314,7 @@ def broadcast_list(context: CallbackContext):
         products = db.get_all_products_flat()
         if not products:
             return
-        lines = ["📦 *Tracked Products:*\n"]
+        lines = ["📦 *Tracked Products — Auto Summary (every 10 min):*\n"]
         for i, p in enumerate(products, 1):
             paused = p.get("tracking_paused", False)
             se     = status_emoji(p.get("last_status", "UNKNOWN"), paused=paused)
