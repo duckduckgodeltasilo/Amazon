@@ -46,6 +46,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 PORT         = int(os.environ.get("PORT", 8080))
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")  # e.g. https://mybot.onrender.com
 GROUP_CHAT_ID = os.environ.get("GROUP_CHAT_ID")  # e.g. -1001234567890 — sab alerts isi group mein jayenge
+AFFILIATE_TAG = "7015105-21"
 
 CHECK_INTERVAL_MIN   = 60
 CHECK_INTERVAL_MAX   = 90
@@ -778,7 +779,7 @@ class AmazonScraper:
             'X-Requested-With':   'XMLHttpRequest',
             'Accept':             'text/html,*/*',
             'Accept-Language':    'en-IN,en;q=0.9',
-            'Referer':            f'https://www.amazon.in/dp/{asin}',
+            'Referer':            f'https://www.amazon.in/dp/{asin}',  # tag-free — sirf display url mein tag hai, fetch mein kahin nahi
             'User-Agent':         random.choice(AmazonScraper.USER_AGENTS),
             'Sec-Fetch-Site':     'same-origin',
             'Sec-Fetch-Mode':     'cors',
@@ -1266,8 +1267,8 @@ def handle_message(update: Update, context: CallbackContext):
             if any(p["asin"] == asin for p in existing):
                 update.message.reply_text("ℹ️ *This product is already in your list!*", parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_keyboard())
                 return
-            # ?aod=1 — variant lock rehta hai, redirect nahi hota
-            canonical_url = f"https://www.amazon.in/dp/{asin}?aod=1"
+            # ?aod=1 — variant lock rehta hai, redirect nahi hota; tag — apna affiliate tag, koi bhi purana tag discard
+            canonical_url = f"https://www.amazon.in/dp/{asin}?aod=1&tag={AFFILIATE_TAG}"
             wait = update.message.reply_text(f"🔎 Fetching info for `{asin}`…", parse_mode=ParseMode.MARKDOWN)
             info = AmazonScraper.fetch_product_info(asin, canonical_url)
             db.add_product(user_id, asin, info["title"], canonical_url)
