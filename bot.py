@@ -280,6 +280,9 @@ class DatabaseManager:
     def get_products(self, user_id):
         return self.execute("SELECT * FROM products WHERE user_id=%s ORDER BY id", (user_id,), fetch_all=True) or []
 
+    def get_all_products_flat(self):
+        return self.execute("SELECT * FROM products ORDER BY id", fetch_all=True) or []
+
     def get_all_products_with_users(self):
         return self.execute("""
             SELECT p.*, u.chat_id, u.user_id
@@ -736,8 +739,10 @@ class AmazonScraper:
     # Known colors — title mein mile toh aage laao
     KNOWN_COLORS = [
         'Cosmic Orange', 'Desert Titanium', 'White Titanium', 'Black Titanium',
-        'Natural Titanium', 'Blue Titanium', 'Ultramarine', 'Pebble',
+        'Natural Titanium', 'Blue Titanium', 'Sage Green', 'Cloud White', 'Jet Black',
+        'Ultramarine', 'Pebble',
         'Starlight', 'Midnight', 'Natural', 'Titanium',
+        'Glacier', 'Burgundy',
         'Black', 'White', 'Blue', 'Red', 'Green', 'Gold', 'Silver',
         'Purple', 'Yellow', 'Pink', 'Orange', 'Teal', 'Coral',
         'Lavender', 'Mint', 'Sage', 'Sky', 'Storm', 'Olive',
@@ -1304,6 +1309,27 @@ def handle_message(update: Update, context: CallbackContext):
 #  SCHEDULED STOCK CHECK
 # ═══════════════════════════════════════════════
 
+def broadcast_list(context: CallbackContext):
+    try:
+        products = db.get_all_products_flat()
+        if not products:
+            return
+        lines = ["📦 *Tracked Products:*\n"]
+        for i, p in enumerate(products, 1):
+            paused = p.get("tracking_paused", False)
+            se     = status_emoji(p.get("last_status", "UNKNOWN"), paused=paused)
+            lines.append(f"`{i}.` {se} [{short_title(p['title'])}]({p['url']})\n")
+        lines.append(f"_Total: {len(products)}_")
+        context.bot.send_message(
+            chat_id=GROUP_CHAT_ID,
+            text="\n".join(lines),
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True
+        )
+    except Exception as e:
+        logger.error(f"broadcast_list error: {e}")
+
+
 def scheduled_stock_check(context: CallbackContext):
     global _check_deadline, _last_full_check, _consecutive_bad_cycles, _extra_cooldown_until, _tail_penalty_asins
 
@@ -1711,6 +1737,9 @@ def main():
 
     updater.job_queue.run_repeating(_keepalive_ping, interval=60, first=10)
     logger.info("✅ DB keepalive registered (every 60s)")
+
+    updater.job_queue.run_repeating(broadcast_list, interval=600, first=60)
+    logger.info("✅ Channel list-broadcast registered (every 10 min)")
 
     updater.start_polling(drop_pending_updates=True, poll_interval=1.0, timeout=20)
     logger.info("✅ Bot is live! Send /start to begin.")
