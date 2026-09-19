@@ -1246,8 +1246,22 @@ def remove_cmd(update: Update, context: CallbackContext):
 
 
 def button_handler(update: Update, context: CallbackContext):
+    for attempt in range(2):
+        try:
+            _button_handler_impl(update, context)
+            return
+        except (NetworkError, TimedOut) as e:
+            logger.warning(f"button_handler timeout (attempt {attempt+1}): {e}")
+            time.sleep(1)
+    logger.error("button_handler: gave up after retries")
+
+
+def _button_handler_impl(update: Update, context: CallbackContext):
     query = update.callback_query
-    query.answer()
+    try:
+        query.answer()
+    except (NetworkError, TimedOut) as e:
+        logger.warning(f"query.answer() timeout (non-critical, continuing): {e}")
     data  = query.data
     logger.info(f"🔘 button_handler received: {data}")
 
@@ -1950,7 +1964,7 @@ def main():
     logger.info("✅ Self-ping started (every 4 min)")
 
     updater = Updater(token=BOT_TOKEN, use_context=True,
-                      request_kwargs={"connect_timeout": 20, "read_timeout": 20})
+                      request_kwargs={"connect_timeout": 30, "read_timeout": 30})
 
     try:
         updater.bot.delete_webhook(drop_pending_updates=True)
