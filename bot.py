@@ -812,11 +812,14 @@ class AmazonScraper:
     def _reorder_color(title: str) -> str:
         """Title mein color mile toh aage lao, warna as-is return karo."""
         for color in AmazonScraper.KNOWN_COLORS:
+            if re.match(rf'^{re.escape(color)}\s*\|\s', title, re.IGNORECASE):
+                return title  # already reordered — dobara process mat karo
+        for color in AmazonScraper.KNOWN_COLORS:
             pattern = re.compile(re.escape(color), re.IGNORECASE)
             if pattern.search(title):
                 # Color nikaalo title se (aas paas ke separators bhi)
                 cleaned = pattern.sub('', title)
-                cleaned = re.sub(r'[\s,;:\-|]+$', '', cleaned.strip())
+                cleaned = re.sub(r'^[\s,;:\-|]+|[\s,;:\-|]+$', '', cleaned).strip()
                 cleaned = re.sub(r'\s{2,}', ' ', cleaned).strip()
                 return f'{color} | {cleaned}'
         return title
@@ -1330,7 +1333,7 @@ def _button_handler_impl(update: Update, context: CallbackContext):
         context.user_data["awaiting_broadcast_msg"] = True
         context.user_data.pop("awaiting_link", None)
         query.message.reply_text(
-            "📝 *Send your broadcast message:*\n\n_I'll ask for its interval next.*",
+            "📝 *Send your broadcast message:*\n\n_I'll ask for its interval next._",
             parse_mode=ParseMode.MARKDOWN
         )
         return
@@ -1493,7 +1496,8 @@ def _refresh_existing_titles():
         updated = 0
         for p in products:
             old_title = p.get("title") or ""
-            new_title = AmazonScraper._reorder_color(old_title)
+            new_title = re.sub(r'(\|\s*){2,}', '| ', old_title).strip()
+            new_title = AmazonScraper._reorder_color(new_title)
             if new_title != old_title:
                 db.update_title(p["id"], new_title)
                 updated += 1
