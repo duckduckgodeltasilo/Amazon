@@ -977,6 +977,10 @@ def _cookie_refresh_thread():
         time.sleep(AmazonScraper._COOKIE_REFRESH_TTL)
 
 
+def id_cmd(update: Update, context: CallbackContext):
+    update.message.reply_text(f"Chat ID: `{update.effective_chat.id}`", parse_mode=ParseMode.MARKDOWN)
+
+
 def start(update: Update, context: CallbackContext):
     user = update.effective_user
     try:
@@ -1690,6 +1694,7 @@ def main():
 
     dp = updater.dispatcher
     dp.add_handler(CommandHandler("start",       start))
+    dp.add_handler(CommandHandler("id",          id_cmd))
     dp.add_handler(CommandHandler("status",      status_check))
     dp.add_handler(CallbackQueryHandler(button_handler))
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
