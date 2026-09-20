@@ -1056,6 +1056,7 @@ def start(update: Update, context: CallbackContext):
     try:
         db.upsert_user(user.id, update.effective_chat.id, user.username)
         db.set_user_stopped(user.id, False)
+        db.set_setting("bot_paused", "0")
         update.message.reply_text(
             "Hey\n\n"
             "Track any Amazon.in product and get instant alerts the moment it comes back in stock.\n\n"
@@ -1074,9 +1075,10 @@ def stop_cmd(update: Update, context: CallbackContext):
         return
     try:
         db.set_user_stopped(user_id, True)
+        db.set_setting("bot_paused", "1")
         target.reply_text(
             "🛑 *All tracking stopped.*\n\n"
-            "No more stock checks or alerts will be sent.\n\n"
+            "No more stock checks, alerts, or broadcasts will be sent.\n\n"
             "Send /start anytime to resume tracking.",
             parse_mode=ParseMode.MARKDOWN
         )
@@ -1509,6 +1511,8 @@ def _refresh_existing_titles():
 
 def broadcast_list(context: CallbackContext):
     """Sends the tracked-products list-summary — runs independently of custom broadcast messages."""
+    if db.get_setting("bot_paused") == "1":
+        return
     try:
         products = db.get_all_products_flat()
         if not products:
@@ -1531,6 +1535,8 @@ def broadcast_list(context: CallbackContext):
 
 def broadcast_ticker(context: CallbackContext):
     """Runs every minute — sends each saved broadcast message on its own interval."""
+    if db.get_setting("bot_paused") == "1":
+        return
     try:
         for m in db.get_due_broadcast_messages():
             try:
