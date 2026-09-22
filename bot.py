@@ -2002,8 +2002,11 @@ def main():
     updater.job_queue.run_repeating(_keepalive_ping, interval=60, first=10)
     logger.info("✅ DB keepalive registered (every 60s)")
 
-    updater.job_queue.run_repeating(broadcast_list, interval=600, first=60, name="broadcast_list_job")
-    logger.info("✅ Channel broadcast registered (every 10 min, fixed)")
+    # ⛔ Disabled: fixed "Tracked Products — Auto Summary" job jo har 10 min mein
+    # apne aap group/channel mein broadcast ho jata tha. Custom /broadcast
+    # messages (broadcast_ticker, neeche) is se independent hain aur chalte rahenge.
+    # updater.job_queue.run_repeating(broadcast_list, interval=600, first=60, name="broadcast_list_job")
+    # logger.info("✅ Channel broadcast registered (every 10 min, fixed)")
 
     updater.job_queue.run_repeating(broadcast_ticker, interval=60, first=30, name="broadcast_ticker_job")
     logger.info("✅ Per-message broadcast ticker registered (checks every 1 min)")
