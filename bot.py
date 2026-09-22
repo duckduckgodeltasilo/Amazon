@@ -1611,7 +1611,9 @@ def scheduled_stock_check(context: CallbackContext):
     if not products:
         return
 
-    dynamic_interval = random.uniform(10, 15)
+    # Fixed gap: 1 product = 1s, har additional product = +0.5s
+    # (2 product = 1.5s, 3 product = 2s, ...)
+    dynamic_interval = 0.5 * len(products) + 0.5
     if time.time() - _last_full_check < dynamic_interval:
         return  # silently skip
 
@@ -1994,10 +1996,10 @@ def main():
 
     updater.job_queue.run_repeating(
         scheduled_stock_check,
-        interval=5, first=15,
+        interval=1, first=1,
         job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 5}
     )
-    logger.info("✅ Stock checker: every 5s tick, gated by 5-10s random jitter")
+    logger.info("✅ Stock checker: 1s tick, gated by fixed gap (1s @1 product, +0.5s per extra product)")
 
     updater.job_queue.run_repeating(_keepalive_ping, interval=60, first=10)
     logger.info("✅ DB keepalive registered (every 60s)")
