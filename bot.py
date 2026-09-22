@@ -9,6 +9,7 @@ import random
 import threading
 import os
 import sys
+from types import SimpleNamespace
 from urllib.parse import quote
 from threading import Lock
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
@@ -1590,7 +1591,42 @@ def interval_cmd(update: Update, context: CallbackContext):
     )
 
 
-def scheduled_stock_check(context: CallbackContext):
+def _stock_check_loop(bot):
+    """
+    APScheduler tick ki jagah plain background loop — koi wasted tick/misfire
+    nahi, seedha: check chalao -> exact fixed gap sleep karo -> repeat.
+    context ki jagah sirf .bot chahiye (scheduled_stock_check aur
+    _dispatch_status_change / _handle_status_change dono sirf context.bot
+    use karte hain), isliye halka SimpleNamespace kaafi hai.
+    """
+    fake_ctx = SimpleNamespace(bot=bot)
+    logger.info("✅ Stock checker: manual loop (no scheduler tick), fixed gap = 0.5×N + 0.5s")
+
+    while True:
+        try:
+            # 503 circuit breaker cooldown active ho to poora remaining
+            # cooldown time hi so jao — har second dobara try karke DB
+            # hit karne ki zaroorat nahi.
+            remaining_cooldown = _extra_cooldown_until - time.time()
+            if remaining_cooldown > 0:
+                time.sleep(min(remaining_cooldown, 60))  # 60s cap taaki naya cooldown extend ho to bhi jaldi react ho
+                continue
+
+            scheduled_stock_check(fake_ctx)
+        except Exception as e:
+            logger.error(f"Stock check loop error: {e}")
+
+        try:
+            products = db.get_all_products_with_users() or []
+        except Exception as e:
+            logger.error(f"Stock check loop — product count fetch error: {e}")
+            products = []
+
+        gap = (0.5 * len(products) + 0.5) if products else 5.0
+        time.sleep(gap)
+
+
+def scheduled_stock_check(context):
     global _check_deadline, _last_full_check, _consecutive_bad_cycles, _extra_cooldown_until, _tail_penalty_asins
 
     # Step -1: 503 circuit breaker — agar pichle cycles mein zyada 503 aaye,
@@ -1994,12 +2030,12 @@ def main():
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
     dp.add_error_handler(error_handler)
 
-    updater.job_queue.run_repeating(
-        scheduled_stock_check,
-        interval=1, first=1,
-        job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 5}
-    )
-    logger.info("✅ Stock checker: 1s tick, gated by fixed gap (1s @1 product, +0.5s per extra product)")
+    threading.Thread(
+        target=_stock_check_loop,
+        args=(updater.bot,),
+        daemon=True,
+        name="stock-check-loop"
+    ).start()
 
     updater.job_queue.run_repeating(_keepalive_ping, interval=60, first=10)
     logger.info("✅ DB keepalive registered (every 60s)")
