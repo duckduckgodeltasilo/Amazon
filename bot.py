@@ -1006,7 +1006,8 @@ _TAIL_PENALTY_CYCLES = 5
 # Agar ek cycle mein zyada 503 aaye, Amazon abhi block-mode mein hai —
 # lagatar retry karna aur bhi zyada flag karega. Isliye backoff badhao
 # aur agla cycle extra der tak skip karo, jab tak 503s kam na hon.
-_consecutive_bad_cycles = 0   # kitne cycles mein 503-rate high raha
+_consecutive_bad_cycles = 0   # kitne cycles mein 503-rate high raha (escalation ke liye)
+_bad_streak_count       = 0   # lagatar kitne cycles bad_ratio>=0.5 rahe (threshold-check ke liye, cooldown trigger hone se pehle)
 _extra_cooldown_until   = 0.0  # is timestamp tak koi scheduled check nahi
 
 # ── Manual /status override ───────────────────────────────────────────
@@ -1627,7 +1628,7 @@ def _stock_check_loop(bot):
 
 
 def scheduled_stock_check(context):
-    global _check_deadline, _last_full_check, _consecutive_bad_cycles, _extra_cooldown_until, _tail_penalty_asins
+    global _check_deadline, _last_full_check, _consecutive_bad_cycles, _bad_streak_count, _extra_cooldown_until, _tail_penalty_asins
 
     # Step -1: 503 circuit breaker — agar pichle cycles mein zyada 503 aaye,
     # cooldown window ke andar naya cycle skip karo. Amazon ko lagatar
@@ -1754,13 +1755,37 @@ def scheduled_stock_check(context):
 
         # Cycle ke baad: agar bahut zyada 503 aaye, circuit breaker trigger
         # karo — agla cycle(s) lambe cooldown ke sath skip karo.
-        bad_ratio = bad_count / max(1, len(shuffled))
+        #
+        # Single ek-off bad cycle par turant cooldown NAHI lagana — isse
+        # single-product setup me (jahan 1 fail = 100% bad_ratio) ek random
+        # 503 hi turant 5min block laga deta tha. Ab lagatar bad cycles ka
+        # streak chahiye:
+        #   - 1 product tracked  -> 3 lagatar bad cycles (matlab 3 lagatar 503)
+        #   - 2+ products tracked -> 2 lagatar bad cycles (jinme har cycle
+        #                            me >=50% products fail hue hon)
+        bad_ratio       = bad_count / max(1, len(shuffled))
+        streak_needed   = 3 if n_products == 1 else 2
+
         if bad_ratio >= 0.5:
-            _consecutive_bad_cycles += 1
-            cooldown = min(300 * _consecutive_bad_cycles, 1800)  # 5min, 10min... cap 30min
-            _extra_cooldown_until = time.time() + cooldown
-            logger.warning(f"🧊 High 503 rate ({bad_count}/{len(shuffled)}) — cooldown {cooldown}s, streak={_consecutive_bad_cycles}")
+            _bad_streak_count += 1
+            if _bad_streak_count >= streak_needed:
+                _consecutive_bad_cycles += 1
+                cooldown = min(300 * _consecutive_bad_cycles, 1800)  # 5min, 10min... cap 30min
+                _extra_cooldown_until = time.time() + cooldown
+                logger.warning(
+                    f"🧊 {_bad_streak_count} lagatar bad cycles (ratio {bad_ratio:.0%}) "
+                    f"— cooldown {cooldown}s, escalation streak={_consecutive_bad_cycles}"
+                )
+                _bad_streak_count = 0  # cooldown lag gaya, streak fresh se ginna shuru
+            else:
+                logger.info(
+                    f"⚠️ Bad cycle {_bad_streak_count}/{streak_needed} "
+                    f"({bad_count}/{len(shuffled)} failed) — cooldown abhi nahi, aur streak chahiye"
+                )
         else:
+            if _bad_streak_count > 0:
+                logger.info(f"✅ Good cycle — bad streak reset (tha: {_bad_streak_count})")
+            _bad_streak_count       = 0
             _consecutive_bad_cycles = 0
 
         # Tail penalty queue update: existing entries ka counter ghatao,
