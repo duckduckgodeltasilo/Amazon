@@ -1053,6 +1053,23 @@ def id_cmd(update: Update, context: CallbackContext):
     update.message.reply_text(f"Chat ID: `{update.effective_chat.id}`", parse_mode=ParseMode.MARKDOWN)
 
 
+def _group_alert_label():
+    enabled = db.get_setting("group_alerts_enabled", "1") == "1"
+    return f"🔔 Group Alerts: ON" if enabled else f"🔕 Group Alerts: OFF"
+
+
+def alert_cmd(update: Update, context: CallbackContext):
+    target = update.message or (update.callback_query and update.callback_query.message)
+    if not target:
+        return
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(_group_alert_label(), callback_data="toggle_group_alert")]])
+    target.reply_text(
+        "🔔 *Group Alert Broadcasting*\n\n_Tap to turn group alerts ON/OFF:_",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=keyboard
+    )
+
+
 def start(update: Update, context: CallbackContext):
     user = update.effective_user
     try:
@@ -1331,6 +1348,16 @@ def _button_handler_impl(update: Update, context: CallbackContext):
         return
 
     if data == "noop":
+        return
+
+    if data == "toggle_group_alert":
+        current = db.get_setting("group_alerts_enabled", "1") == "1"
+        db.set_setting("group_alerts_enabled", "0" if current else "1")
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(_group_alert_label(), callback_data="toggle_group_alert")]])
+        try:
+            query.edit_message_reply_markup(reply_markup=keyboard)
+        except Exception:
+            pass
         return
 
     if data == "bc_new":
@@ -1863,6 +1890,9 @@ def _handle_status_change_locked(context, product, old, new, old_price=None, new
 
 
 def _handle_status_change(context, product, old, new, old_price=None, new_price=None):
+    if db.get_setting("group_alerts_enabled", "1") == "0":
+        return
+
     chat_id = GROUP_CHAT_ID
     title   = product["title"]
     url     = product["url"]
@@ -2048,6 +2078,7 @@ def main():
     dp = updater.dispatcher
     dp.add_handler(CommandHandler("start",       start))
     dp.add_handler(CommandHandler("id",          id_cmd))
+    dp.add_handler(CommandHandler("alert",       alert_cmd))
     dp.add_handler(CommandHandler("broadcast",   broadcast_cmd))
     dp.add_handler(CommandHandler("interval",    interval_cmd))
     dp.add_handler(CommandHandler("status",      status_check))
