@@ -979,7 +979,10 @@ def main_menu_keyboard():
         [InlineKeyboardButton("⏳ Status",      callback_data="cmd_status"),
          InlineKeyboardButton("🗑 Remove",      callback_data="cmd_remove")],
         [InlineKeyboardButton("⏸ Pause",       callback_data="cmd_pause"),
-         InlineKeyboardButton("🛑 Stop",        callback_data="cmd_stop")],
+         InlineKeyboardButton("🔔 Alert",       callback_data="cmd_alert")],
+        [InlineKeyboardButton("📢 Broadcast",   callback_data="cmd_broadcast"),
+         InlineKeyboardButton("⏱ Interval",     callback_data="cmd_interval")],
+        [InlineKeyboardButton("🛑 Stop",        callback_data="cmd_stop")],
     ])
 
 
@@ -1296,6 +1299,9 @@ def _button_handler_impl(update: Update, context: CallbackContext):
         "cmd_remove":     remove_cmd,
         "cmd_pause":      pause_cmd,
         "cmd_stop":       stop_cmd,
+        "cmd_alert":      alert_cmd,
+        "cmd_broadcast":  broadcast_cmd,
+        "cmd_interval":   interval_cmd,
     }
     if data in command_map:
         command_map[data](update, context)
@@ -1588,12 +1594,15 @@ def _short_preview(text, length=40):
 
 
 def broadcast_cmd(update: Update, context: CallbackContext):
+    target = update.message or (update.callback_query and update.callback_query.message)
+    if not target:
+        return
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("🆕 New",    callback_data="bc_new"),
         InlineKeyboardButton("📋 List",   callback_data="bc_list"),
         InlineKeyboardButton("🗑 Remove", callback_data="bc_remove"),
     ]])
-    update.message.reply_text(
+    target.reply_text(
         "📢 *Broadcast Messages*\n\n_Choose an action:_",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=keyboard
@@ -1601,9 +1610,12 @@ def broadcast_cmd(update: Update, context: CallbackContext):
 
 
 def interval_cmd(update: Update, context: CallbackContext):
+    target = update.message or (update.callback_query and update.callback_query.message)
+    if not target:
+        return
     messages = db.get_broadcast_messages()
     if not messages:
-        update.message.reply_text(
+        target.reply_text(
             "🗂️ *No broadcast messages saved.*\n\nUse /broadcast → New to add one.",
             parse_mode=ParseMode.MARKDOWN
         )
@@ -1612,7 +1624,7 @@ def interval_cmd(update: Update, context: CallbackContext):
         [InlineKeyboardButton(f"{_short_preview(m['text'])}  ⏱ {m['interval_minutes']}m", callback_data=f"bciv_{m['id']}")]
         for m in messages
     ]
-    update.message.reply_text(
+    target.reply_text(
         "⏱️ *Pick a message to change its interval:*",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(keyboard)
