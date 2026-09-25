@@ -1902,10 +1902,8 @@ def _handle_status_change_locked(context, product, old, new, old_price=None, new
 
 
 def _handle_status_change(context, product, old, new, old_price=None, new_price=None):
-    if db.get_setting("group_alerts_enabled", "1") == "0":
-        return
-
-    chat_id = GROUP_CHAT_ID
+    group_alerts_on = db.get_setting("group_alerts_enabled", "1") == "1"
+    chat_id = GROUP_CHAT_ID if group_alerts_on else product["user_id"]
     title   = product["title"]
     url     = product["url"]
 
