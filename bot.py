@@ -953,7 +953,7 @@ class AmazonScraper:
                 logger.info(
                     f'[{asin}] status={status} price={price} '
                     f'has_price={has_price} has_seller={has_seller} has_cart={has_cart} '
-                    f'no_delivery_promise={has_no_delivery_promise} has_delivery_date={has_delivery_date}'
+                    f'no_delivery_promise={has_no_delivery_promise} has_delivery_date={has_delivery_date} delivery_date={delivery_date!r}'
                 )
 
             elif resp is not None:
