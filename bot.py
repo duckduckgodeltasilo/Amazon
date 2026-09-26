@@ -843,6 +843,7 @@ class AmazonScraper:
         title  = f'Product {asin}'
         status = 'UNKNOWN'
         price  = None
+        delivery_date = None
 
         client  = AmazonScraper._get_session_client()
         timeout = httpx.Timeout(connect=4.0, read=8.0, write=4.0, pool=4.0)
@@ -937,7 +938,9 @@ class AmazonScraper:
                 # MESSAGE_LARGE/SMALL ke saath data-csa-c-delivery-time =
                 # real deliverable date hai.
                 has_no_delivery_promise = 'NO_PROMISE_UPSELL_MESSAGE' in ajax_html
-                has_delivery_date = bool(re.search(r'data-csa-c-delivery-time="[^"]+"', ajax_html))
+                delivery_match = re.search(r'data-csa-c-delivery-time="([^"]+)"', ajax_html)
+                has_delivery_date = bool(delivery_match)
+                delivery_date = delivery_match.group(1) if delivery_match else None
 
                 status = 'IN_STOCK' if (has_price or has_seller or has_cart) else 'OUT_OF_STOCK'
 
@@ -959,7 +962,7 @@ class AmazonScraper:
         except Exception as e:
             logger.warning(f'AJAX fetch error {asin}: {e}')
 
-        return {'title': title, 'url': aod_url, 'status': status, 'price': price, 'asin': asin}
+        return {'title': title, 'url': aod_url, 'status': status, 'price': price, 'asin': asin, 'delivery_date': delivery_date}
 
 
 
@@ -1761,7 +1764,7 @@ def scheduled_stock_check(context):
                     old_price = row["last_price"]  if row else product.get("last_price")
                     logger.info(f"[{product['asin']}] 503/UNKNOWN — skipping DB update, keeping status={old}")
 
-                _dispatch_status_change(context, product, old, info["status"], old_price, info.get("price"))
+                _dispatch_status_change(context, product, old, info["status"], old_price, info.get("price"), info.get("delivery_date"))
             except Exception as e:
                 logger.error(f"Check error {product.get('asin','?')}: {e}")
 
@@ -1877,10 +1880,10 @@ def _parse_price_value(price_str):
 #  1) scraping worker turant free ho jaye (18s tak block na ho)
 #  2) multiple products ek saath IN_STOCK hon to unke alert-bursts bhi
 #     genuinely parallel chalein (koi lock/serialization nahi)
-def _dispatch_status_change(context, product, old, new, old_price=None, new_price=None):
+def _dispatch_status_change(context, product, old, new, old_price=None, new_price=None, delivery_date=None):
     threading.Thread(
         target=_handle_status_change_locked,
-        args=(context, product, old, new, old_price, new_price),
+        args=(context, product, old, new, old_price, new_price, delivery_date),
         daemon=True,
         name=f"alert-{product.get('asin','?')}"
     ).start()
@@ -1896,12 +1899,12 @@ def _dispatch_status_change(context, product, old, new, old_price=None, new_pric
 _alert_send_lock = threading.Lock()
 
 
-def _handle_status_change_locked(context, product, old, new, old_price=None, new_price=None):
+def _handle_status_change_locked(context, product, old, new, old_price=None, new_price=None, delivery_date=None):
     with _alert_send_lock:
-        _handle_status_change(context, product, old, new, old_price, new_price)
+        _handle_status_change(context, product, old, new, old_price, new_price, delivery_date)
 
 
-def _handle_status_change(context, product, old, new, old_price=None, new_price=None):
+def _handle_status_change(context, product, old, new, old_price=None, new_price=None, delivery_date=None):
     group_alerts_on = db.get_setting("group_alerts_enabled", "1") == "1"
     chat_id = GROUP_CHAT_ID if group_alerts_on else product["user_id"]
     title   = product["title"]
@@ -1954,6 +1957,7 @@ def _handle_status_change(context, product, old, new, old_price=None, new_price=
         logger.info(f"🔥 IN STOCK ({old}→IN_STOCK): {product['asin']} — {alert_count} alerts")
         keyboard   = InlineKeyboardMarkup([[InlineKeyboardButton("🛒 Buy Now on Amazon", url=url)]])
         price_line = f"💰 *Price: {new_price}*\n\n" if new_price else ""
+        delivery_line = f"📅 *Delivery: {delivery_date}*\n\n" if delivery_date else ""
         for i in range(1, alert_count + 1):
             t_send = time.time()
             try:
@@ -1963,6 +1967,7 @@ def _handle_status_change(context, product, old, new, old_price=None, new_price=
                         f"🚨 *IN STOCK!* ({i}/{alert_count})\n\n"
                         f"📦 *{short_title(title, 80)}*\n\n"
                         f"{price_line}"
+                        f"{delivery_line}"
                         f"🛒 [Buy Now on Amazon]({url})\n\n"
                         "_Hurry before it sells out again!_ 🏃"
                     ),
