@@ -995,7 +995,7 @@ class AmazonScraper:
         client = AmazonScraper._get_session_client()
         timeout = httpx.Timeout(connect=3.0, read=5.0, write=3.0, pool=3.0)
         headers = {
-            'User-Agent': random.choice(AmazonScraper.USER_AGENTS),
+            'User-Agent': random.choice(AmazonScraper.MOBILE_USER_AGENTS),
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
             'Accept-Language': 'en-IN,en;q=0.9',
             'Referer': 'https://www.amazon.in/',
@@ -1422,13 +1422,13 @@ def offers_cmd(update: Update, context: CallbackContext):
 
         if debug_on:
             dlines = ["🐞 DEBUG /offers"]
-            html_sent = False
+            html_pick = next((a for a, d in dbg_map.items() if d.get("html") and not d.get("captcha")), None) \
+                        or next((a for a, d in dbg_map.items() if d.get("html")), None)
             for p, offers in results:
                 d = dbg_map.get(p["asin"], {})
                 dlines.append(f"\n{p['asin']} → {len(offers)} offer(s)")
                 dlines.append(", ".join(f"{k}={v}" for k, v in d.items() if k != "html") or "no data")
-                if d.get("html") and not html_sent:
-                    html_sent = True
+                if d.get("html") and p["asin"] == html_pick:
                     target.reply_document(
                         document=io.BytesIO(d["html"].encode("utf-8", errors="ignore")),
                         filename=f"{p['asin']}_dp_partial.html",
