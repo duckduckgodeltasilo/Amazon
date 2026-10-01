@@ -964,8 +964,16 @@ class AmazonScraper:
 
         return {'title': title, 'url': aod_url, 'status': status, 'price': price, 'asin': asin, 'delivery_date': delivery_date}
 
+    _offers_lock = threading.Lock()
+
     @staticmethod
     def fetch_bank_offers(asin: str) -> list:
+        """Add / /offers / hourly job — teeno yahin se guzarte hain; ek time pe sirf ek fetch (Amazon load/503 se bachne ke liye)."""
+        with AmazonScraper._offers_lock:
+            return AmazonScraper._fetch_bank_offers_impl(asin)
+
+    @staticmethod
+    def _fetch_bank_offers_impl(asin: str) -> list:
         """
         Bank/card cashback offers nikalta hai. 2 steps:
           1. Full /dp/{asin} page ko STREAM karke sirf utna padhta hai jitna
@@ -1335,11 +1343,18 @@ def offers_cmd(update: Update, context: CallbackContext):
         results = []
         with ThreadPoolExecutor(max_workers=min(MANUAL_MAX_WORKERS, len(products))) as ex:
             futures = [ex.submit(_check_offers, p) for p in products]
-            for fut in as_completed(futures, timeout=PER_PRODUCT_TIMEOUT + 20):
+            for fut in as_completed(futures, timeout=PER_PRODUCT_TIMEOUT * len(products) + 20):
                 results.append(fut.result())
 
         id_order = {p["id"]: i for i, p in enumerate(products)}
         results.sort(key=lambda x: id_order.get(x[0]["id"], 9999))
+
+        for p, offers in results:
+            if offers:
+                try:
+                    db.set_setting(f"offers_snapshot_{p['asin']}", "||".join(offers))
+                except Exception as e:
+                    logger.warning(f"offers_cmd snapshot save error {p['asin']}: {e}")
 
         lines = ["🏦 *Bank Offers:*\n"]
         for p, offers in results:
@@ -1642,7 +1657,8 @@ def handle_message(update: Update, context: CallbackContext):
             price_line = f"💰 Price: *{info['price']}*\n" if info.get("price") else ""
 
             offers = AmazonScraper.fetch_bank_offers(asin)
-            db.set_setting(f"offers_snapshot_{asin}", "||".join(offers) if offers else "")
+            if offers:
+                db.set_setting(f"offers_snapshot_{asin}", "||".join(offers))
             offers_block = ""
             if offers:
                 offers_block = "\n🏦 *Bank Offers:*\n" + "\n".join(f"• {o}" for o in offers[:8]) + "\n"
@@ -1739,23 +1755,21 @@ def bank_offers_check_job(context: CallbackContext):
     for p in products:
         try:
             offers = AmazonScraper.fetch_bank_offers(p["asin"])
-            new_snapshot = "||".join(offers) if offers else ""
+            if not offers:
+                continue  # fetch fail/block — snapshot mat chhedo (false "Updated" alert se bachne ke liye)
+
+            new_snapshot = "||".join(offers)
             snap_key = f"offers_snapshot_{p['asin']}"
-            old_snapshot = db.get_setting(snap_key, None)  # None = pehli baar check ho raha hai
+            old_snapshot = db.get_setting(snap_key, None)  # None = pehli baar
 
             if old_snapshot is None:
-                # Pehli baar — sirf baseline save karo, message mat bhejo
                 db.set_setting(snap_key, new_snapshot)
                 continue
 
             if new_snapshot == old_snapshot:
-                continue  # kuch nahi badla — chup raho
+                continue
 
             db.set_setting(snap_key, new_snapshot)
-
-            if not offers:
-                # offers the hi nahi ab (pehle the) — chhota info, spam nahi
-                continue
 
             chat_id = GROUP_CHAT_ID if group_alerts_on else p["user_id"]
             lines = [f"🏦 *Bank Offers Updated!*\n\n📦 *{short_title(p['title'], 70)}*\n"]
@@ -1775,7 +1789,7 @@ def bank_offers_check_job(context: CallbackContext):
     logger.info("✅ Bank-offers check done")
 
 
-
+def broadcast_ticker(context: CallbackContext):
     """Runs every minute — sends each saved broadcast message on its own interval."""
     if db.get_setting("bot_paused") == "1":
         return
