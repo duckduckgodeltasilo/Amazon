@@ -7,6 +7,7 @@ import math
 import time
 import random
 import threading
+import io
 import os
 import sys
 from types import SimpleNamespace
@@ -967,13 +968,14 @@ class AmazonScraper:
     _offers_lock = threading.Lock()
 
     @staticmethod
-    def fetch_bank_offers(asin: str) -> list:
-        """Add / /offers / hourly job — teeno yahin se guzarte hain; ek time pe sirf ek fetch (Amazon load/503 se bachne ke liye)."""
+    def fetch_bank_offers(asin: str, debug: dict = None) -> list:
+        """Add / /offers / hourly job — teeno yahin se guzarte hain; ek time pe sirf ek fetch (Amazon load/503 se bachne ke liye).
+        debug (dict) pass karo to stage/http/bytes/title etc. usme fill ho jaate hain (+ fail par page html)."""
         with AmazonScraper._offers_lock:
-            return AmazonScraper._fetch_bank_offers_impl(asin)
+            return AmazonScraper._fetch_bank_offers_impl(asin, debug)
 
     @staticmethod
-    def _fetch_bank_offers_impl(asin: str) -> list:
+    def _fetch_bank_offers_impl(asin: str, debug: dict = None) -> list:
         """
         Bank/card cashback offers nikalta hai. 2 steps:
           1. Full /dp/{asin} page ko STREAM karke sirf utna padhta hai jitna
@@ -989,6 +991,7 @@ class AmazonScraper:
         """
         empty = []
         listing_id = None
+        dbg = debug if debug is not None else {}
         client = AmazonScraper._get_session_client()
         timeout = httpx.Timeout(connect=3.0, read=5.0, write=3.0, pool=3.0)
         headers = {
@@ -997,6 +1000,7 @@ class AmazonScraper:
             'Accept-Language': 'en-IN,en;q=0.9',
             'Referer': 'https://www.amazon.in/',
         }
+        dbg['ua'] = headers['User-Agent'][:70]
         listing_id_re = re.compile(r'id="emiOfferListingId"[^>]*value="([^"]+)"')
         MAX_STREAM_BYTES = 600_000
 
@@ -1006,7 +1010,10 @@ class AmazonScraper:
             total = 0
             with client.stream('GET', f'https://www.amazon.in/dp/{asin}',
                                 headers=headers, timeout=timeout) as resp:
+                dbg['http'] = resp.status_code
+                dbg['final_url'] = str(resp.url)[:120]
                 if resp.status_code != 200:
+                    dbg['stage'] = 'dp_http_not_200'
                     logger.warning(f'bank-offers: full-page fetch HTTP {resp.status_code} for {asin}')
                     return empty
                 for chunk in resp.iter_text(chunk_size=8192):
@@ -1020,10 +1027,22 @@ class AmazonScraper:
                         logger.warning(f'bank-offers: emiOfferListingId not found within {MAX_STREAM_BYTES}B for {asin}')
                         break
         except Exception as e:
+            dbg['stage'] = 'dp_stream_error'
+            dbg['err'] = repr(e)[:150]
             logger.warning(f'bank-offers: full-page stream error {asin}: {e}')
             return empty
 
         if not listing_id:
+            tm = re.search(r"<title[^>]*>(.*?)</title>", buf, re.S)
+            dbg.update(
+                stage='no_listing_id', bytes=total,
+                add_to_cart='add-to-cart-button' in buf, buy_now='buy-now-button' in buf,
+                unavailable='Currently unavailable' in buf, captcha='captcha' in buf.lower(),
+                title=html.unescape(tm.group(1)).strip()[:80] if tm else None,
+            )
+            if debug is not None:
+                dbg['html'] = buf
+            logger.warning(f'bank-offers: NO listing_id {asin} | { {k: v for k, v in dbg.items() if k != "html"} }')
             return empty
 
         # Step 2: all-offers (bank cashback) call
@@ -1035,16 +1054,24 @@ class AmazonScraper:
                 f'&isSmxSecondaryCall=true&asin={asin}&offerListingId={encoded_id}'
             )
             resp = client.get(offers_url, headers=headers, timeout=timeout)
+            dbg['http2'] = resp.status_code
             if resp.status_code != 200:
+                dbg['stage'] = 'sv_http_not_200'
                 logger.warning(f'bank-offers: secondaryView HTTP {resp.status_code} for {asin}')
                 return empty
             body = resp.text
         except Exception as e:
+            dbg['stage'] = 'sv_error'
+            dbg['err'] = repr(e)[:150]
             logger.warning(f'bank-offers: secondaryView error {asin}: {e}')
             return empty
 
         cards = sorted(set(re.findall(r'[A-Za-z]+ Bank [A-Za-z ]*?Card', body)))
         cashback_lines = sorted(set(re.findall(r'Save ₹[\d,]+ as cashback', body)))
+
+        if not cashback_lines and not cards:
+            dbg.update(stage='sv_parsed_nothing', body=len(body), has_cashback='cashback' in body.lower(), has_bank='Bank' in body)
+            logger.warning(f'bank-offers: secondaryView parsed nothing {asin} | body={len(body)}B has_cashback={"cashback" in body.lower()} has_bank={"Bank" in body}')
 
         offers = []
         for c in cashback_lines:
@@ -1053,6 +1080,8 @@ class AmazonScraper:
             # fallback: at least bank names mile to wahi dikhado
             offers = [f'{c} offer available' for c in cards]
 
+        if offers:
+            dbg['stage'] = 'ok'
         return offers
 
 
@@ -1322,6 +1351,12 @@ def status_check(update: Update, context: CallbackContext):
         _manual_status_event.clear()
 
 
+def debug_cmd(update: Update, context: CallbackContext):
+    on = db.get_setting("debug_mode", "0") != "1"
+    db.set_setting("debug_mode", "1" if on else "0")
+    update.message.reply_text(f"🐞 Debug mode {'ON — /offers ab diagnostics bhi bhejega' if on else 'OFF'}")
+
+
 def offers_cmd(update: Update, context: CallbackContext):
     user_id = update.effective_user.id
     target  = update.message or (update.callback_query and update.callback_query.message)
@@ -1334,11 +1369,18 @@ def offers_cmd(update: Update, context: CallbackContext):
             return
         wait_msg = target.reply_text(f"🏦 Checking bank offers for {len(products)} product(s)… please wait.", parse_mode=ParseMode.MARKDOWN)
 
+        debug_on = db.get_setting("debug_mode", "0") == "1"
+        dbg_map  = {}
+
         def _check_offers(p):
             try:
-                return p, AmazonScraper.fetch_bank_offers(p["asin"])
+                if debug_on:
+                    dbg_map[p["asin"]] = {}
+                return p, AmazonScraper.fetch_bank_offers(p["asin"], dbg_map.get(p["asin"]))
             except Exception as e:
                 logger.error(f"offers_cmd fetch error: {e}")
+                if debug_on:
+                    dbg_map[p["asin"]] = {"stage": "exception", "err": repr(e)[:150]}
                 return p, []
 
         results = []
@@ -1377,6 +1419,22 @@ def offers_cmd(update: Update, context: CallbackContext):
             disable_web_page_preview=True,
             reply_markup=main_menu_keyboard()
         )
+
+        if debug_on:
+            dlines = ["🐞 DEBUG /offers"]
+            html_sent = False
+            for p, offers in results:
+                d = dbg_map.get(p["asin"], {})
+                dlines.append(f"\n{p['asin']} → {len(offers)} offer(s)")
+                dlines.append(", ".join(f"{k}={v}" for k, v in d.items() if k != "html") or "no data")
+                if d.get("html") and not html_sent:
+                    html_sent = True
+                    target.reply_document(
+                        document=io.BytesIO(d["html"].encode("utf-8", errors="ignore")),
+                        filename=f"{p['asin']}_dp_partial.html",
+                        caption=f"🐞 {p['asin']} — /dp page (first {len(d['html'])//1000}KB, no listing_id)"
+                    )
+            target.reply_text("\n".join(dlines)[:4000])
     except Exception as e:
         logger.error(f"offers_cmd error: {e}")
         target.reply_text("❌ Error checking offers.")
@@ -2318,6 +2376,7 @@ def main():
     dp.add_handler(CommandHandler("interval",    interval_cmd))
     dp.add_handler(CommandHandler("status",      status_check))
     dp.add_handler(CommandHandler("offers",      offers_cmd))
+    dp.add_handler(CommandHandler("debug",       debug_cmd))
     dp.add_handler(CallbackQueryHandler(button_handler))
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
     dp.add_error_handler(error_handler)
