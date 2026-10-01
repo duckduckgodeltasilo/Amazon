@@ -964,6 +964,89 @@ class AmazonScraper:
 
         return {'title': title, 'url': aod_url, 'status': status, 'price': price, 'asin': asin, 'delivery_date': delivery_date}
 
+    @staticmethod
+    def fetch_bank_offers(asin: str) -> list:
+        """
+        Bank/card cashback offers nikalta hai. 2 steps:
+          1. Full /dp/{asin} page ko STREAM karke sirf utna padhta hai jitna
+             'emiOfferListingId' field milne tak lagta hai (~15% page —
+             poora ~1.5MB download nahi karta, sirf ~200-250KB).
+          2. Us listing-id se offerApplication/secondaryView call karke
+             saare bank cashback offers ek saath nikalta hai (~150KB).
+        Sirf IN_STOCK transition par, alag thread se call hona chahiye —
+        har stock-check poll mein NAHI (zyada load/503-risk se bachne ke liye).
+        Fail/block/503 pe chup-chaap khaali list return karta hai — kabhi
+        bhi retry nahi karta (best-effort hai, core stock-check se bilkul
+        alag aur usse kam priority).
+        """
+        empty = []
+        listing_id = None
+        client = AmazonScraper._get_session_client()
+        timeout = httpx.Timeout(connect=3.0, read=5.0, write=3.0, pool=3.0)
+        headers = {
+            'User-Agent': random.choice(AmazonScraper.USER_AGENTS),
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-IN,en;q=0.9',
+            'Referer': 'https://www.amazon.in/',
+        }
+        listing_id_re = re.compile(r'id="emiOfferListingId"[^>]*value="([^"]+)"')
+        MAX_STREAM_BYTES = 600_000
+
+        # Step 1: streaming early-stop
+        try:
+            buf = ''
+            total = 0
+            with client.stream('GET', f'https://www.amazon.in/dp/{asin}',
+                                headers=headers, timeout=timeout) as resp:
+                if resp.status_code != 200:
+                    logger.warning(f'bank-offers: full-page fetch HTTP {resp.status_code} for {asin}')
+                    return empty
+                for chunk in resp.iter_text(chunk_size=8192):
+                    buf += chunk
+                    total += len(chunk.encode('utf-8', errors='ignore'))
+                    m = listing_id_re.search(buf)
+                    if m:
+                        listing_id = html.unescape(m.group(1))
+                        break
+                    if total > MAX_STREAM_BYTES:
+                        logger.warning(f'bank-offers: emiOfferListingId not found within {MAX_STREAM_BYTES}B for {asin}')
+                        break
+        except Exception as e:
+            logger.warning(f'bank-offers: full-page stream error {asin}: {e}')
+            return empty
+
+        if not listing_id:
+            return empty
+
+        # Step 2: all-offers (bank cashback) call
+        try:
+            encoded_id = quote(listing_id, safe='')
+            offers_url = (
+                'https://www.amazon.in/hz/smx/offerApplication/secondaryView'
+                f'?_encoding=UTF8&buyingOptionType=NEW&buyingOptionIndex=0'
+                f'&isSmxSecondaryCall=true&asin={asin}&offerListingId={encoded_id}'
+            )
+            resp = client.get(offers_url, headers=headers, timeout=timeout)
+            if resp.status_code != 200:
+                logger.warning(f'bank-offers: secondaryView HTTP {resp.status_code} for {asin}')
+                return empty
+            body = resp.text
+        except Exception as e:
+            logger.warning(f'bank-offers: secondaryView error {asin}: {e}')
+            return empty
+
+        cards = sorted(set(re.findall(r'[A-Za-z]+ Bank [A-Za-z ]*?Card', body)))
+        cashback_lines = sorted(set(re.findall(r'Save ₹[\d,]+ as cashback', body)))
+
+        offers = []
+        for c in cashback_lines:
+            offers.append(c)
+        if not offers and cards:
+            # fallback: at least bank names mile to wahi dikhado
+            offers = [f'{c} offer available' for c in cards]
+
+        return offers
+
 
 
 
@@ -1228,6 +1311,59 @@ def status_check(update: Update, context: CallbackContext):
     finally:
         # Manual check khatam — auto check wapas normally chal sakta hai
         _manual_status_event.clear()
+
+
+def offers_cmd(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    target  = update.message or (update.callback_query and update.callback_query.message)
+    if not target:
+        return
+    try:
+        products = db.get_products(user_id)
+        if not products:
+            target.reply_text("🗂️ *No products tracked.*", parse_mode=ParseMode.MARKDOWN)
+            return
+        wait_msg = target.reply_text(f"🏦 Checking bank offers for {len(products)} product(s)… please wait.", parse_mode=ParseMode.MARKDOWN)
+
+        def _check_offers(p):
+            try:
+                return p, AmazonScraper.fetch_bank_offers(p["asin"])
+            except Exception as e:
+                logger.error(f"offers_cmd fetch error: {e}")
+                return p, []
+
+        results = []
+        with ThreadPoolExecutor(max_workers=min(MANUAL_MAX_WORKERS, len(products))) as ex:
+            futures = [ex.submit(_check_offers, p) for p in products]
+            for fut in as_completed(futures, timeout=PER_PRODUCT_TIMEOUT + 20):
+                results.append(fut.result())
+
+        id_order = {p["id"]: i for i, p in enumerate(products)}
+        results.sort(key=lambda x: id_order.get(x[0]["id"], 9999))
+
+        lines = ["🏦 *Bank Offers:*\n"]
+        for p, offers in results:
+            lines.append(f"📦 [{short_title(p['title'])}]({p['url']})")
+            if offers:
+                for o in offers[:5]:
+                    lines.append(f"   • {o}")
+            else:
+                lines.append("   _No bank offers right now_")
+            lines.append("")
+
+        try:
+            wait_msg.delete()
+        except Exception:
+            pass
+        target.reply_text(
+            "\n".join(lines),
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True,
+            reply_markup=main_menu_keyboard()
+        )
+    except Exception as e:
+        logger.error(f"offers_cmd error: {e}")
+        target.reply_text("❌ Error checking offers.")
 
 
 def add_cmd(update: Update, context: CallbackContext):
@@ -1504,6 +1640,13 @@ def handle_message(update: Update, context: CallbackContext):
             db.add_product(user_id, asin, info["title"], canonical_url)
             se         = status_emoji(info["status"])
             price_line = f"💰 Price: *{info['price']}*\n" if info.get("price") else ""
+
+            offers = AmazonScraper.fetch_bank_offers(asin)
+            db.set_setting(f"offers_snapshot_{asin}", "||".join(offers) if offers else "")
+            offers_block = ""
+            if offers:
+                offers_block = "\n🏦 *Bank Offers:*\n" + "\n".join(f"• {o}" for o in offers[:8]) + "\n"
+
             try:
                 wait.delete()
             except Exception:
@@ -1512,7 +1655,8 @@ def handle_message(update: Update, context: CallbackContext):
                 f"✅ *Product Added!*\n\n"
                 f"📦 *{short_title(info['title'], 80)}*\n\n"
                 f"{price_line}"
-                f"📊 Status: {se} `{info['status']}`\n\n"
+                f"📊 Status: {se} `{info['status']}`\n"
+                f"{offers_block}\n"
                 f"🔔 I'll notify you when the status changes!",
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=main_menu_keyboard()
@@ -1571,7 +1715,67 @@ def broadcast_list(context: CallbackContext):
         logger.error(f"broadcast_list error: {e}")
 
 
-def broadcast_ticker(context: CallbackContext):
+def bank_offers_check_job(context: CallbackContext):
+    """
+    Har 1 ghante mein ek baar chalta hai (stock-check wale frequent loop
+    se bilkul alag/independent job). Har active product ke bank-offers
+    nikalta hai, pichli baar ke snapshot se compare karta hai, sirf tabhi
+    message bhejta hai jab kuch BADLA ho — warna chup rehta hai (no spam).
+    """
+    if db.get_setting("bot_paused") == "1":
+        return
+    try:
+        products = db.get_all_products_with_users()
+    except Exception as e:
+        logger.error(f"bank_offers_check_job: products fetch error: {e}")
+        return
+
+    if not products:
+        return
+
+    logger.info(f"🏦 Bank-offers check starting… ({len(products)} product(s))")
+    group_alerts_on = db.get_setting("group_alerts_enabled", "1") == "1"
+
+    for p in products:
+        try:
+            offers = AmazonScraper.fetch_bank_offers(p["asin"])
+            new_snapshot = "||".join(offers) if offers else ""
+            snap_key = f"offers_snapshot_{p['asin']}"
+            old_snapshot = db.get_setting(snap_key, None)  # None = pehli baar check ho raha hai
+
+            if old_snapshot is None:
+                # Pehli baar — sirf baseline save karo, message mat bhejo
+                db.set_setting(snap_key, new_snapshot)
+                continue
+
+            if new_snapshot == old_snapshot:
+                continue  # kuch nahi badla — chup raho
+
+            db.set_setting(snap_key, new_snapshot)
+
+            if not offers:
+                # offers the hi nahi ab (pehle the) — chhota info, spam nahi
+                continue
+
+            chat_id = GROUP_CHAT_ID if group_alerts_on else p["user_id"]
+            lines = [f"🏦 *Bank Offers Updated!*\n\n📦 *{short_title(p['title'], 70)}*\n"]
+            for o in offers[:8]:
+                lines.append(f"• {o}")
+            lines.append(f"\n🔗 [View Product]({p['url']})")
+            context.bot.send_message(
+                chat_id=chat_id,
+                text="\n".join(lines),
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=True
+            )
+        except Exception as e:
+            logger.warning(f"bank_offers_check_job: {p.get('asin')} error: {e}")
+        time.sleep(random.uniform(1.0, 2.0))  # products ke beech halka gap
+
+    logger.info("✅ Bank-offers check done")
+
+
+
     """Runs every minute — sends each saved broadcast message on its own interval."""
     if db.get_setting("bot_paused") == "1":
         return
@@ -2097,6 +2301,7 @@ def main():
     dp.add_handler(CommandHandler("broadcast",   broadcast_cmd))
     dp.add_handler(CommandHandler("interval",    interval_cmd))
     dp.add_handler(CommandHandler("status",      status_check))
+    dp.add_handler(CommandHandler("offers",      offers_cmd))
     dp.add_handler(CallbackQueryHandler(button_handler))
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
     dp.add_error_handler(error_handler)
@@ -2119,6 +2324,9 @@ def main():
 
     updater.job_queue.run_repeating(broadcast_ticker, interval=60, first=30, name="broadcast_ticker_job")
     logger.info("✅ Per-message broadcast ticker registered (checks every 1 min)")
+
+    updater.job_queue.run_repeating(bank_offers_check_job, interval=3600, first=120, name="bank_offers_check_job")
+    logger.info("✅ Bank-offers check registered (every 1 hour)")
 
     updater.start_polling(drop_pending_updates=True, poll_interval=1.0, timeout=20)
     logger.info("✅ Bot is live! Send /start to begin.")
