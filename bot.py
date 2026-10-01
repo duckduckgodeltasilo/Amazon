@@ -1071,12 +1071,13 @@ def main_menu_keyboard():
         [InlineKeyboardButton("➕ Add",        callback_data="cmd_add"),
          InlineKeyboardButton("📋 My List",    callback_data="cmd_list")],
         [InlineKeyboardButton("⏳ Status",      callback_data="cmd_status"),
-         InlineKeyboardButton("🗑 Remove",      callback_data="cmd_remove")],
-        [InlineKeyboardButton("⏸ Pause",       callback_data="cmd_pause"),
-         InlineKeyboardButton("🔔 Alert",       callback_data="cmd_alert")],
-        [InlineKeyboardButton("📢 Broadcast",   callback_data="cmd_broadcast"),
-         InlineKeyboardButton("⏱ Interval",     callback_data="cmd_interval")],
-        [InlineKeyboardButton("🛑 Stop",        callback_data="cmd_stop")],
+         InlineKeyboardButton("🏦 Offers",      callback_data="cmd_offers")],
+        [InlineKeyboardButton("🗑 Remove",      callback_data="cmd_remove"),
+         InlineKeyboardButton("⏸ Pause",       callback_data="cmd_pause")],
+        [InlineKeyboardButton("🔔 Alert",       callback_data="cmd_alert"),
+         InlineKeyboardButton("📢 Broadcast",   callback_data="cmd_broadcast")],
+        [InlineKeyboardButton("⏱ Interval",     callback_data="cmd_interval"),
+         InlineKeyboardButton("🛑 Stop",        callback_data="cmd_stop")],
     ])
 
 
@@ -1456,6 +1457,7 @@ def _button_handler_impl(update: Update, context: CallbackContext):
         "cmd_alert":      alert_cmd,
         "cmd_broadcast":  broadcast_cmd,
         "cmd_interval":   interval_cmd,
+        "cmd_offers":     offers_cmd,
     }
     if data in command_map:
         command_map[data](update, context)
