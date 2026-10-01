@@ -3,17 +3,15 @@
 import logging
 import re
 import html
-import math
 import time
 import random
 import threading
-import io
 import os
 import sys
 from types import SimpleNamespace
 from urllib.parse import quote
 from threading import Lock
-from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import httpx
 from bs4 import BeautifulSoup
@@ -50,8 +48,6 @@ RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")  # e.g. https://
 GROUP_CHAT_ID = os.environ.get("GROUP_CHAT_ID")  # e.g. -1001234567890 — sab alerts isi group mein jayenge
 AFFILIATE_TAG = "7015105-21"
 
-CHECK_INTERVAL_MIN   = 60
-CHECK_INTERVAL_MAX   = 90
 MAX_WORKERS          = 3
 MANUAL_MAX_WORKERS   = 6   # manual /status — user is watching, worth the higher 503 risk
 MAX_PRODUCTS_PER_USER = 20
@@ -380,10 +376,6 @@ class DatabaseManager:
     def set_user_stopped(self, user_id, stopped: bool):
         self.execute("UPDATE users SET is_stopped=%s WHERE user_id=%s", (stopped, user_id))
 
-    def is_user_stopped(self, user_id):
-        row = self.execute("SELECT is_stopped FROM users WHERE user_id=%s", (user_id,), fetch_one=True)
-        return bool(row["is_stopped"]) if row else False
-
     def toggle_product_pause(self, product_id, user_id):
         row = self.execute(
             "SELECT tracking_paused FROM products WHERE id=%s AND user_id=%s",
@@ -566,45 +558,6 @@ class AmazonScraper:
                 return m.group(1)
         return None
 
-    @staticmethod
-    def _build_headers(mobile=False):
-        ua_pool = AmazonScraper.MOBILE_USER_AGENTS if mobile else AmazonScraper.USER_AGENTS
-        headers = {
-            "User-Agent":              random.choice(ua_pool),
-            "Accept":                  "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-            "Accept-Language":         "en-US,en;q=0.9",
-            "Accept-Encoding":         "gzip, deflate, br",
-            "DNT":                     "1",
-            "Connection":              "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
-            "Cache-Control":           "no-cache",
-            "Pragma":                  "no-cache",
-            "Sec-Fetch-Dest":          "document",
-            "Sec-Fetch-Mode":          "navigate",
-            "Sec-Fetch-Site":          "none",
-            "Sec-Fetch-User":          "?1",
-            "Service-Worker-Navigation-Preload": "true",
-            "sec-ch-ua":               '"Not)A;Brand";v="24", "Chromium";v="116"',
-            "sec-ch-ua-mobile":        "?1" if mobile else "?0",
-            "sec-ch-ua-platform":      '"Android"' if mobile else '"Windows"',
-            "device-memory":           "8",
-            "sec-ch-device-memory":    "8",
-            "dpr":                     "2.75" if mobile else "1",
-            "sec-ch-dpr":              "2.75" if mobile else "1",
-            "viewport-width":          "980" if mobile else "1920",
-            "sec-ch-viewport-width":   "980" if mobile else "1920",
-            "rtt":                     "100",
-            "downlink":                "2.4",
-            "ect":                     "4g",
-        }
-        if mobile:
-            headers["X-Requested-With"] = "XMLHttpRequest"
-        return headers
-
-    @staticmethod
-    def _mobile_url(url: str) -> str:
-        return url.replace("www.amazon.in", "m.amazon.in")
-
     # ── Shared, cookie-persistent client ────────────────────────────
     # Real browser session ke jaisa: cookies (session-id, ubid-acbin,
     # sso-*) requests ke beech carry hote hain, har call pe fresh
@@ -724,79 +677,6 @@ class AmazonScraper:
             request_url = f"{CF_PROXY_URL}{sep}url={quote(target_url, safe='')}"
             return request_url, proxy_headers
         return target_url, headers
-
-    @staticmethod
-    def fetch_page(url: str, retries=3) -> str | None:
-        """
-        httpx use karta hai — guaranteed hard timeout at OS level.
-        requests.get OS-level hang karta hai, httpx nahi.
-        """
-        urls_to_try = [url, AmazonScraper._mobile_url(url), url]
-        # httpx.Timeout: connect=5s, read=12s, write=5s, pool=5s
-        timeout = httpx.Timeout(connect=4.0, read=8.0, write=4.0, pool=4.0)
-
-        for attempt in range(retries):
-            use_mobile = (attempt % 2 == 1)
-            fetch_url  = urls_to_try[attempt]
-            try:
-                if attempt > 0:
-                    time.sleep(random.uniform(1, 3))
-
-                client = AmazonScraper._get_session_client()
-                req_headers = AmazonScraper._build_headers(mobile=use_mobile)
-                req_url, req_headers = AmazonScraper._proxied_request(fetch_url, req_headers)
-                resp = client.get(req_url, headers=req_headers, timeout=timeout)
-                if CF_PROXY_URL:
-                    AmazonScraper._store_proxy_cookies(resp, client)
-
-                if resp.status_code == 200:
-                    page = resp.text
-                    if any(kw in page[:3000].lower() for kw in ["robot check", "automated access", "captcha"]):
-                        logger.warning(f"Bot check (attempt {attempt+1}) — switching URL")
-                        time.sleep(random.uniform(2, 4))
-                        continue
-                    return page
-                elif resp.status_code in (503, 429):
-                    wait = random.uniform(2, 4) * (attempt + 1)
-                    logger.warning(f"Rate limited ({resp.status_code}) — waiting {wait:.0f}s")
-                    time.sleep(wait)
-                else:
-                    logger.warning(f"HTTP {resp.status_code} on attempt {attempt+1}")
-                    time.sleep(random.uniform(1, 2))
-
-            except httpx.TimeoutException:
-                logger.warning(f"httpx Timeout (attempt {attempt+1}): {fetch_url}")
-                time.sleep(random.uniform(2, 4))
-            except httpx.ConnectError as e:
-                logger.warning(f"httpx ConnectError: {e}")
-                time.sleep(random.uniform(2, 4))
-            except Exception as e:
-                logger.error(f"fetch_page unexpected error: {e}")
-                time.sleep(1)
-
-        return None
-
-    @staticmethod
-    def _parse_price(soup):
-        try:
-            for pid in ['priceblock_ourprice', 'priceblock_dealprice']:
-                tag = soup.find(id=pid)
-                if tag:
-                    return tag.get_text(strip=True)
-            whole = soup.find('span', class_='a-price-whole')
-            frac  = soup.find('span', class_='a-price-fraction')
-            if whole:
-                w = whole.get_text(strip=True).replace(',', '').rstrip('.')
-                f = frac.get_text(strip=True) if frac else '00'
-                return f'₹{w}.{f}'
-            core = soup.find(id='corePriceDisplay_desktop_feature_div')
-            if core:
-                ps = core.find('span', class_='a-offscreen')
-                if ps:
-                    return ps.get_text(strip=True)
-        except Exception:
-            pass
-        return None
 
     # Known colors — title mein mile toh aage laao
     KNOWN_COLORS = [
@@ -968,14 +848,13 @@ class AmazonScraper:
     _offers_lock = threading.Lock()
 
     @staticmethod
-    def fetch_bank_offers(asin: str, debug: dict = None) -> list:
-        """Add / /offers / hourly job — teeno yahin se guzarte hain; ek time pe sirf ek fetch (Amazon load/503 se bachne ke liye).
-        debug (dict) pass karo to stage/http/bytes/title etc. usme fill ho jaate hain (+ fail par page html)."""
+    def fetch_bank_offers(asin: str) -> list:
+        """Add / /offers / hourly job — teeno yahin se guzarte hain; ek time pe sirf ek fetch (Amazon load/503 se bachne ke liye)."""
         with AmazonScraper._offers_lock:
-            return AmazonScraper._fetch_bank_offers_impl(asin, debug)
+            return AmazonScraper._fetch_bank_offers_impl(asin)
 
     @staticmethod
-    def _fetch_bank_offers_impl(asin: str, debug: dict = None) -> list:
+    def _fetch_bank_offers_impl(asin: str) -> list:
         """
         Bank/card cashback offers nikalta hai. 2 steps:
           1. Full /dp/{asin} page ko STREAM karke sirf utna padhta hai jitna
@@ -991,7 +870,6 @@ class AmazonScraper:
         """
         empty = []
         listing_id = None
-        dbg = debug if debug is not None else {}
         client = AmazonScraper._get_session_client()
         timeout = httpx.Timeout(connect=3.0, read=5.0, write=3.0, pool=3.0)
         headers = {
@@ -1000,7 +878,6 @@ class AmazonScraper:
             'Accept-Language': 'en-IN,en;q=0.9',
             'Referer': 'https://www.amazon.in/',
         }
-        dbg['ua'] = headers['User-Agent'][:70]
         listing_id_re = re.compile(r'id="emiOfferListingId"[^>]*value="([^"]+)"')
         MAX_STREAM_BYTES = 600_000
 
@@ -1010,10 +887,7 @@ class AmazonScraper:
             total = 0
             with client.stream('GET', f'https://www.amazon.in/dp/{asin}',
                                 headers=headers, timeout=timeout) as resp:
-                dbg['http'] = resp.status_code
-                dbg['final_url'] = str(resp.url)[:120]
                 if resp.status_code != 200:
-                    dbg['stage'] = 'dp_http_not_200'
                     logger.warning(f'bank-offers: full-page fetch HTTP {resp.status_code} for {asin}')
                     return empty
                 for chunk in resp.iter_text(chunk_size=8192):
@@ -1027,22 +901,14 @@ class AmazonScraper:
                         logger.warning(f'bank-offers: emiOfferListingId not found within {MAX_STREAM_BYTES}B for {asin}')
                         break
         except Exception as e:
-            dbg['stage'] = 'dp_stream_error'
-            dbg['err'] = repr(e)[:150]
             logger.warning(f'bank-offers: full-page stream error {asin}: {e}')
             return empty
 
         if not listing_id:
-            tm = re.search(r"<title[^>]*>(.*?)</title>", buf, re.S)
-            dbg.update(
-                stage='no_listing_id', bytes=total,
-                add_to_cart='add-to-cart-button' in buf, buy_now='buy-now-button' in buf,
-                unavailable='Currently unavailable' in buf, captcha='captcha' in buf.lower(),
-                title=html.unescape(tm.group(1)).strip()[:80] if tm else None,
+            logger.warning(
+                f'bank-offers: NO listing_id {asin} | read={total}B '
+                f'add_to_cart={"add-to-cart-button" in buf} captcha={"captcha" in buf.lower()}'
             )
-            if debug is not None:
-                dbg['html'] = buf
-            logger.warning(f'bank-offers: NO listing_id {asin} | { {k: v for k, v in dbg.items() if k != "html"} }')
             return empty
 
         # Step 2: all-offers (bank cashback) call
@@ -1054,15 +920,11 @@ class AmazonScraper:
                 f'&isSmxSecondaryCall=true&asin={asin}&offerListingId={encoded_id}'
             )
             resp = client.get(offers_url, headers=headers, timeout=timeout)
-            dbg['http2'] = resp.status_code
             if resp.status_code != 200:
-                dbg['stage'] = 'sv_http_not_200'
                 logger.warning(f'bank-offers: secondaryView HTTP {resp.status_code} for {asin}')
                 return empty
             body = resp.text
         except Exception as e:
-            dbg['stage'] = 'sv_error'
-            dbg['err'] = repr(e)[:150]
             logger.warning(f'bank-offers: secondaryView error {asin}: {e}')
             return empty
 
@@ -1070,18 +932,28 @@ class AmazonScraper:
         cashback_lines = sorted(set(re.findall(r'Save ₹[\d,]+ as cashback', body)))
 
         if not cashback_lines and not cards:
-            dbg.update(stage='sv_parsed_nothing', body=len(body), has_cashback='cashback' in body.lower(), has_bank='Bank' in body)
             logger.warning(f'bank-offers: secondaryView parsed nothing {asin} | body={len(body)}B has_cashback={"cashback" in body.lower()} has_bank={"Bank" in body}')
 
+        # Structured parse: har offer ke saath card ka naam + Non-EMI (full payment) / EMI (No Cost EMI)
+        txt = re.sub(r'<(script|style).*?</\1>', '', body, flags=re.S)
+        txt = re.sub(r'<[^>]+>', '\n', txt)
+        lines = [re.sub(r'\s+', ' ', l).strip() for l in html.unescape(txt).split('\n')]
+        lines = [l for l in lines if l]
+        save_re = re.compile(r'^Save ₹[\d,]+(?: as cashback)?$')
+        emi_re = re.compile(r'^₹[\d,.]+ x \d+m$')
         offers = []
-        for c in cashback_lines:
-            offers.append(c)
+        for i, l in enumerate(lines):
+            if save_re.match(l) and i + 1 < len(lines) and lines[i + 1].endswith('Card'):
+                offers.append(f'Non-EMI | {lines[i + 1]} — {l}')
+            elif l.endswith('Card') and i + 3 < len(lines) and emi_re.match(lines[i + 1]) and lines[i + 3] == 'No Cost EMI':
+                offers.append(f'EMI | {l} — No Cost EMI {lines[i + 1]}')
+        offers = list(dict.fromkeys(offers))
+        if not offers:
+            offers = list(cashback_lines)
         if not offers and cards:
             # fallback: at least bank names mile to wahi dikhado
             offers = [f'{c} offer available' for c in cards]
 
-        if offers:
-            dbg['stage'] = 'ok'
         return offers
 
 
@@ -1351,12 +1223,6 @@ def status_check(update: Update, context: CallbackContext):
         _manual_status_event.clear()
 
 
-def debug_cmd(update: Update, context: CallbackContext):
-    on = db.get_setting("debug_mode", "0") != "1"
-    db.set_setting("debug_mode", "1" if on else "0")
-    update.message.reply_text(f"🐞 Debug mode {'ON — /offers ab diagnostics bhi bhejega' if on else 'OFF'}")
-
-
 def offers_cmd(update: Update, context: CallbackContext):
     user_id = update.effective_user.id
     target  = update.message or (update.callback_query and update.callback_query.message)
@@ -1369,18 +1235,11 @@ def offers_cmd(update: Update, context: CallbackContext):
             return
         wait_msg = target.reply_text(f"🏦 Checking bank offers for {len(products)} product(s)… please wait.", parse_mode=ParseMode.MARKDOWN)
 
-        debug_on = db.get_setting("debug_mode", "0") == "1"
-        dbg_map  = {}
-
         def _check_offers(p):
             try:
-                if debug_on:
-                    dbg_map[p["asin"]] = {}
-                return p, AmazonScraper.fetch_bank_offers(p["asin"], dbg_map.get(p["asin"]))
+                return p, AmazonScraper.fetch_bank_offers(p["asin"])
             except Exception as e:
                 logger.error(f"offers_cmd fetch error: {e}")
-                if debug_on:
-                    dbg_map[p["asin"]] = {"stage": "exception", "err": repr(e)[:150]}
                 return p, []
 
         results = []
@@ -1399,42 +1258,35 @@ def offers_cmd(update: Update, context: CallbackContext):
                 except Exception as e:
                     logger.warning(f"offers_cmd snapshot save error {p['asin']}: {e}")
 
-        lines = ["🏦 *Bank Offers:*\n"]
+        blocks = []
         for p, offers in results:
-            lines.append(f"📦 [{short_title(p['title'])}]({p['url']})")
+            blk = [f"📦 [{short_title(p['title'])}]({p['url']})"]
             if offers:
-                for o in offers[:5]:
-                    lines.append(f"   • {o}")
+                blk += [f"   • {o}" for o in offers[:8]]
             else:
-                lines.append("   _No bank offers right now_")
-            lines.append("")
+                blk.append("   _No bank offers right now_")
+            blocks.append("\n".join(blk))
+
+        # Telegram 4096-char limit — products ke boundary pe split karo
+        chunks, cur = [], "🏦 *Bank Offers:*\n"
+        for blk in blocks:
+            if len(cur) + len(blk) + 2 > 3800:
+                chunks.append(cur)
+                cur = ""
+            cur += blk + "\n\n"
+        chunks.append(cur)
 
         try:
             wait_msg.delete()
         except Exception:
             pass
-        target.reply_text(
-            "\n".join(lines),
-            parse_mode=ParseMode.MARKDOWN,
-            disable_web_page_preview=True,
-            reply_markup=main_menu_keyboard()
-        )
-
-        if debug_on:
-            dlines = ["🐞 DEBUG /offers"]
-            html_pick = next((a for a, d in dbg_map.items() if d.get("html") and not d.get("captcha")), None) \
-                        or next((a for a, d in dbg_map.items() if d.get("html")), None)
-            for p, offers in results:
-                d = dbg_map.get(p["asin"], {})
-                dlines.append(f"\n{p['asin']} → {len(offers)} offer(s)")
-                dlines.append(", ".join(f"{k}={v}" for k, v in d.items() if k != "html") or "no data")
-                if d.get("html") and p["asin"] == html_pick:
-                    target.reply_document(
-                        document=io.BytesIO(d["html"].encode("utf-8", errors="ignore")),
-                        filename=f"{p['asin']}_dp_partial.html",
-                        caption=f"🐞 {p['asin']} — /dp page (first {len(d['html'])//1000}KB, no listing_id)"
-                    )
-            target.reply_text("\n".join(dlines)[:4000])
+        for i, chunk in enumerate(chunks):
+            target.reply_text(
+                chunk,
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=True,
+                reply_markup=main_menu_keyboard() if i == len(chunks) - 1 else None
+            )
     except Exception as e:
         logger.error(f"offers_cmd error: {e}")
         target.reply_text("❌ Error checking offers.")
@@ -1767,30 +1619,6 @@ def _refresh_existing_titles():
         logger.error(f"_refresh_existing_titles error: {e}")
 
 
-def broadcast_list(context: CallbackContext):
-    """Sends the tracked-products list-summary — runs independently of custom broadcast messages."""
-    if db.get_setting("bot_paused") == "1":
-        return
-    try:
-        products = db.get_all_products_flat()
-        if not products:
-            return
-        lines = ["📦 *Tracked Products — Auto Summary (every 10 min):*\n"]
-        for i, p in enumerate(products, 1):
-            paused = p.get("tracking_paused", False)
-            se     = status_emoji(p.get("last_status", "UNKNOWN"), paused=paused)
-            lines.append(f"`{i}.` {se} [{short_title(p['title'])}]({p['url']})\n")
-        lines.append(f"_Total: {len(products)}_")
-        context.bot.send_message(
-            chat_id=GROUP_CHAT_ID,
-            text="\n".join(lines),
-            parse_mode=ParseMode.MARKDOWN,
-            disable_web_page_preview=True
-        )
-    except Exception as e:
-        logger.error(f"broadcast_list error: {e}")
-
-
 def bank_offers_check_job(context: CallbackContext):
     """
     Har 1 ghante mein ek baar chalta hai (stock-check wale frequent loop
@@ -2002,7 +1830,6 @@ def scheduled_stock_check(context):
         logger.info("🔄 Scheduled stock check starting…")
         logger.info(f"Checking {n_products} product(s) | workers: {n_workers} (batched) | timeout: {total_timeout}s")
 
-        t0 = time.time()
         # Har cycle mein order shuffle karo — fixed order + fixed interval
         # milke ek predictable "bot pattern" banata hai jo detection ko
         # aur aasan bana deta hai.
@@ -2376,7 +2203,6 @@ def main():
     dp.add_handler(CommandHandler("interval",    interval_cmd))
     dp.add_handler(CommandHandler("status",      status_check))
     dp.add_handler(CommandHandler("offers",      offers_cmd))
-    dp.add_handler(CommandHandler("debug",       debug_cmd))
     dp.add_handler(CallbackQueryHandler(button_handler))
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
     dp.add_error_handler(error_handler)
@@ -2390,12 +2216,6 @@ def main():
 
     updater.job_queue.run_repeating(_keepalive_ping, interval=60, first=10)
     logger.info("✅ DB keepalive registered (every 60s)")
-
-    # ⛔ Disabled: fixed "Tracked Products — Auto Summary" job jo har 10 min mein
-    # apne aap group/channel mein broadcast ho jata tha. Custom /broadcast
-    # messages (broadcast_ticker, neeche) is se independent hain aur chalte rahenge.
-    # updater.job_queue.run_repeating(broadcast_list, interval=600, first=60, name="broadcast_list_job")
-    # logger.info("✅ Channel broadcast registered (every 10 min, fixed)")
 
     updater.job_queue.run_repeating(broadcast_ticker, interval=60, first=30, name="broadcast_ticker_job")
     logger.info("✅ Per-message broadcast ticker registered (checks every 1 min)")
