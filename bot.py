@@ -250,6 +250,7 @@ class DatabaseManager:
             ("tracking_paused", "BOOLEAN DEFAULT FALSE"),
             ("alert_instock",   "BOOLEAN DEFAULT TRUE"),
             ("alert_pricedrop", "BOOLEAN DEFAULT TRUE"),
+            ("alert_offers",    "BOOLEAN DEFAULT FALSE"),  # restock pe offers check — default OFF
         ]:
             self._add_column_if_missing("products", col, defn)
 
@@ -390,6 +391,20 @@ class DatabaseManager:
         self.execute("UPDATE products SET tracking_paused=%s WHERE id=%s AND user_id=%s", (new_state, product_id, user_id))
         return new_state
 
+
+    def toggle_product_offers(self, product_id, user_id):
+        row = self.execute(
+            "SELECT alert_offers FROM products WHERE id=%s AND user_id=%s",
+            (product_id, user_id), fetch_one=True
+        )
+        if not row:
+            return None
+        new_state = not bool(row["alert_offers"])
+        self.execute("UPDATE products SET alert_offers=%s WHERE id=%s AND user_id=%s", (new_state, product_id, user_id))
+        return new_state
+
+    def set_all_offers_off(self, user_id):
+        self.execute("UPDATE products SET alert_offers=FALSE WHERE user_id=%s", (user_id,))
 
     def get_alert_settings(self, user_id):
         row = self.execute(
@@ -852,8 +867,11 @@ class AmazonScraper:
 
     @staticmethod
     def fetch_bank_offers(asin: str) -> list:
-        """Add / /offers / hourly job — teeno yahin se guzarte hain; ek time pe sirf ek fetch (Amazon load/503 se bachne ke liye)."""
+        """Add / /offers / hourly job / restock trigger — sabhi yahin se guzarte hain.
+        Ek time pe sirf ek fetch, aur har fetch se pehle random 1-2s jitter (lock ke andar,
+        taaki do fetch ke beech hamesha gap rahe) — Amazon load/503 se bachne ke liye."""
         with AmazonScraper._offers_lock:
+            time.sleep(random.uniform(1.0, 2.0))
             return AmazonScraper._fetch_bank_offers_impl(asin)
 
     @staticmethod
@@ -865,8 +883,8 @@ class AmazonScraper:
              poora ~1.5MB download nahi karta, sirf ~200-250KB).
           2. Us listing-id se offerApplication/secondaryView call karke
              saare bank cashback offers ek saath nikalta hai (~150KB).
-        Sirf IN_STOCK transition par, alag thread se call hona chahiye —
-        har stock-check poll mein NAHI (zyada load/503-risk se bachne ke liye).
+        Har stock-check poll mein NAHI chalta (zyada load/503-risk) — sirf Add,
+        /offers, hourly job aur IN_STOCK transition ke baad.
         Fail/block/503 pe chup-chaap khaali list return karta hai — kabhi
         bhi retry nahi karta (best-effort hai, core stock-check se bilkul
         alag aur usse kam priority).
@@ -1060,15 +1078,32 @@ def _group_alert_label():
     return f"🔔 Group Alerts: ON" if enabled else f"🔕 Group Alerts: OFF"
 
 
+def _alert_menu_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(_group_alert_label(), callback_data="toggle_group_alert")],
+        [InlineKeyboardButton("🏦 Restock Offers Check", callback_data="ofr_menu")],
+    ])
+
+
+def _offers_toggle_keyboard(products):
+    keyboard = []
+    for i, p in enumerate(products, 1):
+        on = bool(p.get("alert_offers", False))
+        label = f"{i}.  {'✅ ON' if on else '⚪ OFF'}  {short_title(p['title'], 25)}"
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"ofr_{p['id']}")])
+    keyboard.append([InlineKeyboardButton("🛑 Stop all", callback_data="ofr_off_all"),
+                     InlineKeyboardButton("✅ Done", callback_data="rm_cancel")])
+    return InlineKeyboardMarkup(keyboard)
+
+
 def alert_cmd(update: Update, context: CallbackContext):
     target = update.message or (update.callback_query and update.callback_query.message)
     if not target:
         return
-    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(_group_alert_label(), callback_data="toggle_group_alert")]])
     target.reply_text(
         "🔔 *Group Alert Broadcasting*\n\n_Tap to turn group alerts ON/OFF:_",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=keyboard
+        reply_markup=_alert_menu_keyboard()
     )
 
 
@@ -1297,7 +1332,8 @@ def offers_cmd(update: Update, context: CallbackContext):
         for p, offers in results:
             if offers:
                 try:
-                    db.set_setting(f"offers_snapshot_{p['asin']}", "||".join(offers))
+                    with _offers_snapshot_lock:
+                        db.set_setting(f"offers_snapshot_{p['asin']}", "||".join(offers))
                 except Exception as e:
                     logger.warning(f"offers_cmd snapshot save error {p['asin']}: {e}")
 
@@ -1472,9 +1508,34 @@ def _button_handler_impl(update: Update, context: CallbackContext):
     if data == "toggle_group_alert":
         current = db.get_setting("group_alerts_enabled", "1") == "1"
         db.set_setting("group_alerts_enabled", "0" if current else "1")
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(_group_alert_label(), callback_data="toggle_group_alert")]])
         try:
-            query.edit_message_reply_markup(reply_markup=keyboard)
+            query.edit_message_reply_markup(reply_markup=_alert_menu_keyboard())
+        except Exception:
+            pass
+        return
+
+    if data == "ofr_menu":
+        products = db.get_products(update.effective_user.id)
+        if not products:
+            query.message.reply_text("🗂️ *No products tracked.*", parse_mode=ParseMode.MARKDOWN)
+            return
+        query.message.reply_text(
+            "🏦 *Offers check on restock*\n\n"
+            "Product stock mein aate hi uske bank offers check honge (default: OFF).\n"
+            "_Tap a product to toggle ON/OFF:_",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_offers_toggle_keyboard(products)
+        )
+        return
+
+    if data == "ofr_off_all" or (data.startswith("ofr_") and data[4:].isdigit()):
+        user_id = update.effective_user.id
+        if data == "ofr_off_all":
+            db.set_all_offers_off(user_id)
+        elif db.toggle_product_offers(int(data[4:]), user_id) is None:
+            return
+        try:
+            query.edit_message_reply_markup(reply_markup=_offers_toggle_keyboard(db.get_products(user_id)))
         except Exception:
             pass
         return
@@ -1617,7 +1678,8 @@ def handle_message(update: Update, context: CallbackContext):
 
             offers = AmazonScraper.fetch_bank_offers(asin)
             if offers:
-                db.set_setting(f"offers_snapshot_{asin}", "||".join(offers))
+                with _offers_snapshot_lock:
+                    db.set_setting(f"offers_snapshot_{asin}", "||".join(offers))
             offers_block = ""
             if offers:
                 offers_block = "\n🏦 *Bank Offers:*\n" + "\n".join(f"• {o}" for o in offers[:8]) + "\n"
@@ -1682,6 +1744,112 @@ def _fix_existing_urls():
         logger.error(f"_fix_existing_urls error: {e}")
 
 
+_offers_snapshot_lock = threading.Lock()  # snapshot read-compare-write atomic (Add / /offers / hourly / restock ek hi key chhuten)
+
+_EMI_RE     = re.compile(r'^EMI \| (.+?) — No Cost EMI (₹[\d,.]+) x (\d+m)$')
+_NON_EMI_RE = re.compile(r'^Non-EMI \| (.+?) — (.+)$')
+
+
+def _offer_key(o):
+    """(key, label, value) — 'Changed' pair karne ke liye; structured format na ho to None."""
+    m = _EMI_RE.match(o)
+    if m:
+        return ("EMI", m.group(1), m.group(3)), f"EMI | {m.group(1)} ({m.group(3)})", m.group(2)
+    m = _NON_EMI_RE.match(o)
+    if m:
+        return ("Non-EMI", m.group(1)), f"Non-EMI | {m.group(1)}", m.group(2)
+    return None
+
+
+def _is_structured(offers):
+    return any(o.startswith(("Non-EMI | ", "EMI | ")) for o in offers)
+
+
+def _diff_offers(old, new):
+    """-> (added, changed[(label, old_val, new_val)], removed, unchanged_count)."""
+    old_set, new_set = set(old), set(new)
+    added   = [o for o in new if o not in old_set]
+    removed = [o for o in old if o not in new_set]
+    unchanged = len(new_set & old_set)
+
+    def group(items):
+        g = {}
+        for o in items:
+            k = _offer_key(o)
+            if k:
+                g.setdefault(k[0], []).append((o, k))
+        return g
+
+    ga, gr = group(added), group(removed)
+    changed = []
+    for key, rem in gr.items():
+        add = ga.get(key)
+        if add and len(add) == 1 and len(rem) == 1:  # sirf saaf 1:1 jodi ko 'Changed' maano
+            (ro, rk), (ao, ak) = rem[0], add[0]
+            changed.append((ak[1], rk[2], ak[2]))
+            added.remove(ao)
+            removed.remove(ro)
+    return added, changed, removed, unchanged
+
+
+def _offers_check_and_alert(bot, p):
+    """Ek product ke offers fetch -> saved snapshot se compare -> badla ho to diff alert
+    (➕ New / 🔄 Changed / ➖ Removed). Hourly job aur restock trigger dono yahin se guzarte hain."""
+    offers = AmazonScraper.fetch_bank_offers(p["asin"])
+    if not offers:
+        return  # fetch fail/block — snapshot mat chhedo (false "Updated" alert se bachne ke liye)
+
+    snap_key = f"offers_snapshot_{p['asin']}"
+    with _offers_snapshot_lock:
+        old_raw = db.get_setting(snap_key, None)  # None = pehli baar
+        if old_raw is None:
+            db.set_setting(snap_key, "||".join(offers))
+            return
+        old = [o for o in old_raw.split("||") if o]
+        added, changed, removed, unchanged = _diff_offers(old, offers)
+        if (not added and not changed and not removed) or _is_structured(old) != _is_structured(offers):
+            # kuch nahi badla (sirf order), ya purana/naya format switch — chupchap baseline update
+            if "||".join(offers) != old_raw:
+                db.set_setting(snap_key, "||".join(offers))
+            return
+        db.set_setting(snap_key, "||".join(offers))
+
+    def _section(title, items):
+        out = [title] + [f"• {o}" for o in items[:8]]
+        if len(items) > 8:
+            out.append(f"• …+{len(items) - 8} more")
+        return out + [""]
+
+    lines = [f"🏦 *Bank Offers Updated!*\n📦 *{short_title(p['title'], 70)}*\n"]
+    if added:
+        lines += _section("➕ *New*", added)
+    if changed:
+        lines += _section("🔄 *Changed*", [f"{label}\n  {o} → {n}" for label, o, n in changed])
+    if removed:
+        lines += _section("➖ *Removed*", removed)
+    all_link = f"[🏦 View all offers](https://t.me/{bot.username}?start=o_{p['asin']})"
+    lines.append(f"✅ {unchanged} unchanged · {all_link}" if unchanged else all_link)
+    lines.append(f"🔗 [View Product]({p['url']})")
+
+    group_alerts_on = db.get_setting("group_alerts_enabled", "1") == "1"
+    chat_id = GROUP_CHAT_ID if group_alerts_on else p["user_id"]
+    bot.send_message(
+        chat_id=chat_id,
+        text="\n".join(lines),
+        parse_mode=ParseMode.MARKDOWN,
+        disable_web_page_preview=True
+    )
+
+
+def _offers_after_instock(bot, product):
+    """IN_STOCK alerts bhejne ke BAAD alag daemon thread mein sirf isi product ka offers check (per-product toggle ON ho tab).
+    Doosre offers calls ke saath fetch_bank_offers ka lock+jitter serialize karta hai."""
+    try:
+        _offers_check_and_alert(bot, product)
+    except Exception as e:
+        logger.warning(f"offers_after_instock {product.get('asin')} error: {e}")
+
+
 def bank_offers_check_job(context: CallbackContext):
     """
     Har 1 ghante mein ek baar chalta hai (stock-check wale frequent loop
@@ -1700,42 +1868,15 @@ def bank_offers_check_job(context: CallbackContext):
     if not products:
         return
 
+    # OUT_OF_STOCK page pe offers hote hi nahi (verified) — faltu Amazon call mat karo; restock pe trigger alag se chalta hai
+    products = [p for p in products if p.get("last_status") != "OUT_OF_STOCK"]
+    random.shuffle(products)  # har run mein random order
     logger.info(f"🏦 Bank-offers check starting… ({len(products)} product(s))")
-    group_alerts_on = db.get_setting("group_alerts_enabled", "1") == "1"
-
     for p in products:
         try:
-            offers = AmazonScraper.fetch_bank_offers(p["asin"])
-            if not offers:
-                continue  # fetch fail/block — snapshot mat chhedo (false "Updated" alert se bachne ke liye)
-
-            new_snapshot = "||".join(offers)
-            snap_key = f"offers_snapshot_{p['asin']}"
-            old_snapshot = db.get_setting(snap_key, None)  # None = pehli baar
-
-            if old_snapshot is None:
-                db.set_setting(snap_key, new_snapshot)
-                continue
-
-            if new_snapshot == old_snapshot:
-                continue
-
-            db.set_setting(snap_key, new_snapshot)
-
-            chat_id = GROUP_CHAT_ID if group_alerts_on else p["user_id"]
-            lines = [f"🏦 *Bank Offers Updated!*\n\n📦 *{short_title(p['title'], 70)}*\n"]
-            for o in offers[:8]:
-                lines.append(f"• {o}")
-            lines.append(f"\n🔗 [View Product]({p['url']})")
-            context.bot.send_message(
-                chat_id=chat_id,
-                text="\n".join(lines),
-                parse_mode=ParseMode.MARKDOWN,
-                disable_web_page_preview=True
-            )
+            _offers_check_and_alert(context.bot, p)
         except Exception as e:
             logger.warning(f"bank_offers_check_job: {p.get('asin')} error: {e}")
-        time.sleep(random.uniform(1.0, 2.0))  # products ke beech halka gap
 
     logger.info("✅ Bank-offers check done")
 
@@ -2148,6 +2289,12 @@ def _handle_status_change(context, product, old, new, old_price=None, new_price=
                 logger.error(f"Alert {i}/{alert_count} error: {e}")
             if i < alert_count and gap > 0:
                 time.sleep(gap)
+        if product.get("alert_offers", False):
+            # alag daemon thread — stock-check aur doosre products ke alerts pe koi asar nahi (side by side)
+            threading.Thread(
+                target=_offers_after_instock, args=(context.bot, product),
+                daemon=True, name=f"offers-{product.get('asin', '?')}"
+            ).start()
 
     elif old == "IN_STOCK" and new == "OUT_OF_STOCK":
         logger.info(f"🔴 OUT OF STOCK: {product['asin']}")
