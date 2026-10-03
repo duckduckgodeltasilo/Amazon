@@ -373,6 +373,9 @@ class DatabaseManager:
     def update_title(self, product_id, title):
         return self.execute("UPDATE products SET title=%s WHERE id=%s", (title, product_id))
 
+    def update_url(self, product_id, url):
+        return self.execute("UPDATE products SET url=%s WHERE id=%s", (url, product_id))
+
     def set_user_stopped(self, user_id, stopped: bool):
         self.execute("UPDATE users SET is_stopped=%s WHERE user_id=%s", (stopped, user_id))
 
@@ -1071,6 +1074,9 @@ def alert_cmd(update: Update, context: CallbackContext):
 
 def start(update: Update, context: CallbackContext):
     user = update.effective_user
+    if context.args and context.args[0].startswith("o_"):
+        offers_detail(update, context.args[0][2:])
+        return
     try:
         db.upsert_user(user.id, update.effective_chat.id, user.username)
         db.set_user_stopped(user.id, False)
@@ -1223,6 +1229,43 @@ def status_check(update: Update, context: CallbackContext):
         _manual_status_event.clear()
 
 
+def _split_offers(offers):
+    """('Non-EMI | card — x', 'EMI | card — y', ...) -> (non_emi, emi, other) — prefix hata ke."""
+    non_emi = [o[len("Non-EMI | "):] for o in offers if o.startswith("Non-EMI | ")]
+    emi     = [o[len("EMI | "):]     for o in offers if o.startswith("EMI | ")]
+    other   = [o for o in offers if not o.startswith(("Non-EMI | ", "EMI | "))]
+    return non_emi, emi, other
+
+
+def offers_detail(update: Update, asin: str):
+    """/offers list ke 'N offers' link (t.me/bot?start=o_<asin>) se aata hai — last saved offers dikhata hai."""
+    if not re.fullmatch(r"[A-Z0-9]{10}", asin):
+        return
+    user_id = update.effective_user.id
+    try:
+        snap = db.get_setting(f"offers_snapshot_{asin}", "") or ""
+        prod = next((p for p in db.get_products(user_id) if p["asin"] == asin), None)
+        if not snap or not prod:
+            update.message.reply_text("🏦 Saved offers nahi mile — pehle /offers chalao.", reply_markup=main_menu_keyboard())
+            return
+        non_emi, emi, other = _split_offers(snap.split("||"))
+        lines = [f"📦 [{short_title(prod['title'], 70)}]({prod['url']})\n"]
+        if non_emi:
+            lines += [f"💳 *Non-EMI ({len(non_emi)})*"] + [f"• {o}" for o in non_emi] + [""]
+        if emi:
+            lines += [f"🧾 *EMI ({len(emi)})*"] + [f"• {o}" for o in emi] + [""]
+        if other:
+            lines += [f"🏦 *Offers ({len(other)})*"] + [f"• {o}" for o in other] + [""]
+        update.message.reply_text(
+            "\n".join(lines),
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True,
+            reply_markup=main_menu_keyboard()
+        )
+    except Exception as e:
+        logger.error(f"offers_detail error: {e}")
+
+
 def offers_cmd(update: Update, context: CallbackContext):
     user_id = update.effective_user.id
     target  = update.message or (update.callback_query and update.callback_query.message)
@@ -1259,10 +1302,14 @@ def offers_cmd(update: Update, context: CallbackContext):
                     logger.warning(f"offers_cmd snapshot save error {p['asin']}: {e}")
 
         blocks = []
-        for p, offers in results:
-            blk = [f"📦 [{short_title(p['title'])}]({p['url']})"]
+        bot_username = context.bot.username
+        for n, (p, offers) in enumerate(results, 1):
+            blk = [f"{n}. [{short_title(p['title'])}]({p['url']})"]
             if offers:
-                blk += [f"   • {o}" for o in offers[:8]]
+                non_emi, emi, _ = _split_offers(offers)
+                parts = ([f"{len(non_emi)} Non-EMI"] if non_emi else []) + ([f"{len(emi)} EMI"] if emi else [])
+                label = f"🏦 {len(offers)} offer{'s' if len(offers) > 1 else ''}" + (f" ({' · '.join(parts)})" if parts else "")
+                blk.append(f"   [{label}](https://t.me/{bot_username}?start=o_{p['asin']})")
             else:
                 blk.append("   _No bank offers right now_")
             blocks.append("\n".join(blk))
@@ -1561,7 +1608,7 @@ def handle_message(update: Update, context: CallbackContext):
                 update.message.reply_text("ℹ️ *This product is already in your list!*", parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_keyboard())
                 return
             # ?aod=1 — variant lock rehta hai, redirect nahi hota; tag — apna affiliate tag, koi bhi purana tag discard
-            canonical_url = f"https://www.amazon.in/dp/{asin}?aod=1&tag={AFFILIATE_TAG}"
+            canonical_url = f"https://www.amazon.in/dp/{asin}?tag={AFFILIATE_TAG}&aod=1"
             wait = update.message.reply_text(f"🔎 Fetching info for `{asin}`…", parse_mode=ParseMode.MARKDOWN)
             info = AmazonScraper.fetch_product_info(asin, canonical_url)
             db.add_product(user_id, asin, info["title"], canonical_url)
@@ -1617,6 +1664,22 @@ def _refresh_existing_titles():
             logger.info(f"🎨 Refreshed {updated} product title(s) with updated color list.")
     except Exception as e:
         logger.error(f"_refresh_existing_titles error: {e}")
+
+
+def _fix_existing_urls():
+    """Startup pe ek baar: purane saved '?aod=1&tag=X' links ko '?tag=X&aod=1' format mein badalta hai (sirf DB update)."""
+    try:
+        old_suffix = f"?aod=1&tag={AFFILIATE_TAG}"
+        updated = 0
+        for p in db.get_all_products_flat():
+            url = p.get("url") or ""
+            if url.endswith(old_suffix):
+                db.update_url(p["id"], url[:-len(old_suffix)] + f"?tag={AFFILIATE_TAG}&aod=1")
+                updated += 1
+        if updated:
+            logger.info(f"🔗 Updated {updated} product link(s) to ?tag=…&aod=1 format.")
+    except Exception as e:
+        logger.error(f"_fix_existing_urls error: {e}")
 
 
 def bank_offers_check_job(context: CallbackContext):
@@ -2175,6 +2238,7 @@ def main():
     logger.info("=" * 60)
 
     _refresh_existing_titles()
+    _fix_existing_urls()
 
     threading.Thread(target=_run_health_server, daemon=True).start()
     logger.info(f"✅ Health server on port {PORT}")
